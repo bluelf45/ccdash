@@ -1,0 +1,24 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  selftest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.8", "3.x"]
+        pillow: [true, false]
+        exclude:  # no 3.8 builds for Apple silicon runners
+          - os: macos-latest
+            python: "3.8"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - if: matrix.pillow
+        run: pip install Pillow
+      - run: python ccdash.py --selftest
+      - run: python ccdash.py --demo --once > /dev/null

@@ -1,0 +1,5 @@
+*.gif
+*.png
+!docs/**
+__pycache__/
+*.tmp

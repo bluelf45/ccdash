@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ccdash"
+dynamic = ["version"]
+description = "Terminal dashboard for Claude Code, Codex and opencode: plan limits, cost, and a card per session"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+keywords = ["claude-code", "codex", "opencode", "tui", "dashboard", "terminal"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+art = ["Pillow"]
+
+[project.scripts]
+ccdash = "ccdash:main"
+
+[project.urls]
+Homepage = "https://github.com/bluelf45/ccdash"
+
+[tool.setuptools]
+py-modules = ["ccdash"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ccdash.__version__"}
