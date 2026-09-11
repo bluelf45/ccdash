@@ -1578,10 +1578,12 @@ def selftest():
            "resets_at": _plus(now, 4 * 3600)}
     assert full_by(lim) == "", full_by(lim)
     lim["percent"] = 50  # 1h in at 50% -> full one hour from now
-    assert full_by(lim).endswith((now + timedelta(hours=1)).astimezone().strftime("%H:%M"))
+    # full_by reads the clock a moment after `now`: either side of a minute's edge
+    near = lambda at, fmt: [(at + timedelta(seconds=d)).astimezone().strftime(fmt)
+                            for d in (-60, 0, 60)]
+    assert full_by(lim)[-5:] in near(now + timedelta(hours=1), "%H:%M"), full_by(lim)
     week = {"kind": "weekly_all", "percent": 50, "resets_at": _plus(now, 4 * 86400)}
-    hits = iso(week["resets_at"]) - timedelta(days=1)
-    assert full_by(week) == hits.astimezone().strftime("%a %H:%M"), \
+    assert full_by(week) in near(now + timedelta(days=3), "%a %H:%M"), \
         "3 days in at 50%: full 3 days from now, and it says which day"
     assert abs(window_frac(lim) - 0.2) < 0.01, "1h into a 5h window"
     assert window_frac({"kind": "session"}) is None
