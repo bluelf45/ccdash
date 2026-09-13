@@ -14,8 +14,11 @@ live card per session saying which ones are working and which are waiting on you
 - **Sessions:** one card each — working, waiting on you, error or idle; what you asked, what the
   agent said or which tool it's in, context used. It rings the bell when a session stops to
   wait on you.
-- **Jump in:** pick a card and press ⏎ to reopen that session in its own tmux window, with a
-  column of limits and stats beside it. `alt+0` comes back, `alt+1`–`9` switch sessions.
+- **Jump in:** the dashboard runs in a tmux server of its own per run; pick a card and press ⏎
+  to reopen that session in its own window there, with a column of limits and stats beside it.
+  `alt+0` comes back, `alt+1`–`9` switch sessions. Quitting asks first, then closes that server,
+  agent windows included. Inside your own tmux, ⏎ opens the session as a window there too, but
+  the `alt+` keys aren't bound.
 - One Python file, standard library only. Pillow is optional, for your own animated art (and
   real pixels on sixel terminals).
 
@@ -51,19 +54,23 @@ you what it can and can't see.
 | `h j k l` / arrows | pick a card |
 | `⏎` | open the picked session |
 | `/` | filter by title, project, branch or prompt |
-| `esc` | drop the pick and filter; again to quit |
+| `esc` | drop the pick and filter |
 | `g` | hourly chart: $ / output tokens / all tokens |
 | `t` | next theme (remembered) |
 | `r` | refresh now |
 | `J K` / PgUp PgDn | scroll |
+| `wheel` | scroll |
+| `ctrl+z` | suspend — `fg` comes back repainted |
 | `?` | help |
-| `q` | quit |
+| `q` | quit — asks first when agent windows are open (`ctrl+c` too; `ctrl+d` quits without asking) |
 
 ## Extras
 
 **Exact "waiting" cards.** A transcript can't show that Claude is stuck on a permission prompt,
 so by default a tool call that goes quiet for 60 seconds counts as waiting. A Notification hook
-makes it exact. Add this to `~/.claude/settings.json`:
+makes it exact. ccdash looks for it in `~/.claude/settings.json` (or
+`$CLAUDE_CONFIG_DIR/settings.json`) and falls back to the 60-second guess when it isn't there.
+Add this to `~/.claude/settings.json`:
 
 ```json
 {
@@ -96,6 +103,7 @@ last time the dashboard looked, so leave one running.
 | `CCDASH_THEME` | theme name; overrides the one `t` saved |
 | `CCDASH_ART` | path to art, instead of `art.gif` |
 | `CCDASH_SIXEL=0` | half blocks even on a sixel terminal |
+| `CCDASH_FRAME` | seconds per art frame (default 0.12); `0` stops the animation on its first frame |
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME` | where the agents keep their files, if you moved them |
 
 Themes: ccdash, catppuccin-mocha, catppuccin-latte, dracula, nord, tokyo-night, gruvbox,
