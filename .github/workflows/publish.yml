@@ -18,5 +18,7 @@ jobs:
         with:
           python-version: "3.x"
       - run: python ccdash.py --selftest
+      - name: tag matches __version__
+        run: test "${GITHUB_REF_NAME#v}" = "$(python -c 'import ccdash; print(ccdash.__version__)')"
       - run: pip install build && python -m build
       - uses: pypa/gh-action-pypi-publish@release/v1

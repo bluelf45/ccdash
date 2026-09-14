@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ccdash - coding agent dashboard: chibi + clock, usage limits, session cards."""
+"""ccdash - coding agent dashboard: chibi + clock, usage limits, repos and their sessions."""
 
 import codecs
 import contextlib
@@ -10,6 +10,7 @@ import glob
 import json
 import os
 import re
+import resource
 import select
 import shlex
 import shutil
@@ -25,6 +26,7 @@ import tty
 import unicodedata
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 
 __version__ = "0.1.0"
@@ -43,6 +45,8 @@ SETTINGS = os.path.join(CLAUDE, "settings.json")
 CHIBI_ART = os.environ.get("CCDASH_ART") or os.path.join(CONFIG, "art.gif")
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 REFRESH = 5  # transcript rescan: only files whose mtime moved get parsed again
+# where REPOS looks for git repositories; real, as git and the agents spell cwds
+ROOT = os.path.realpath(os.path.expanduser(os.environ.get("CCDASH_ROOT") or "~"))
 # Seconds per art frame. Animating repaints the art: ~240 KB/s of truecolor
 # half-blocks, or a sixel tmux decodes each time - 8 fps of sixel keeps a
 # tmux server at ~18% of a core, 4 fps at ~9%. CCDASH_FRAME=0.25 slows it,
@@ -53,6 +57,183 @@ except ValueError:
     FRAME = 0.12
 
 KEY = (0x12, 0x12, 0x1A)  # keyed_art floods the art's background to this
+
+# --------------------------------------------------------------- settings
+
+CONFIG_FILE = os.path.join(CONFIG, "config.json")
+# Every knob, with what it is worth when the file leaves it out. The file
+# says what you like; the env var in ENVS beats it, for one run.
+DEFAULTS = {
+    "agents": ["claude", "codex", "opencode"],
+    "art": "",
+    "bell": True,
+    "claude_dir": "",
+    "codex_home": "",
+    "depth": 3,
+    "frame": 0.12,
+    "history_days": 14,
+    "idle_after": 1800,
+    "max_cards": 24,
+    "opencode_db": "",
+    "prices": {},
+    "refresh": 5.0,
+    "root": "~",
+    "sixel": True,
+    "theme": "",
+    "wait_after": 60,
+}
+ENVS = {"art": "CCDASH_ART", "claude_dir": "CLAUDE_CONFIG_DIR",
+        "codex_home": "CODEX_HOME", "frame": "CCDASH_FRAME",
+        "root": "CCDASH_ROOT", "sixel": "CCDASH_SIXEL", "theme": "CCDASH_THEME"}
+RANGE = {"depth": (1, 8), "frame": (0.0, 5.0), "history_days": (1, 90),
+         "idle_after": (60, 86400), "max_cards": (4, 200),
+         "refresh": (1.0, 300.0), "wait_after": (5, 3600)}
+CONF = dict(DEFAULTS)  # what this run goes by
+SOURCE = {}            # knob -> "default" | "config.json" | "$CCDASH_ROOT"
+COMPLAINTS = []        # "knob: what it should have been", for --doctor
+
+# the knobs whose initial value is nowhere else in the file; the rest
+# (ROOT, FRAME, REFRESH, CHIBI_ART, MAX_CARDS, PRICE, AGENTS) already exist,
+# and apply_config() writes over them.
+DEPTH = DEFAULTS["depth"]
+SIXEL = DEFAULTS["sixel"]
+BELL = DEFAULTS["bell"]
+HISTORY = DEFAULTS["history_days"]
+WAIT_AFTER = DEFAULTS["wait_after"]
+IDLE_AFTER = DEFAULTS["idle_after"]
+
+
+def coerce(key, val):
+    """`val` as the knob's type, numbers clamped to RANGE. A ValueError says
+    the shape it wanted, so the complaint reads as advice."""
+    want = DEFAULTS[key]
+    if isinstance(want, bool):  # before int: True is an int
+        if not isinstance(val, bool):
+            raise ValueError("true or false")
+        return val
+    if isinstance(want, (int, float)):
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError("a number")
+        lo, hi = RANGE[key]
+        return type(want)(min(hi, max(lo, val)))
+    if isinstance(want, str):
+        if not isinstance(val, str):
+            raise ValueError("a string")
+        return val
+    if key == "agents":
+        if not isinstance(val, list) or any(a not in DEFAULTS["agents"] for a in val):
+            raise ValueError("a list of " + ", ".join(DEFAULTS["agents"]))
+        return list(val)
+    shape = '{"model-prefix": [in, out]} in $ per 1M tokens'
+    if not isinstance(val, dict):
+        raise ValueError(shape)
+    out = {}
+    for model, pair in val.items():
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and all(
+                isinstance(x, (int, float)) and not isinstance(x, bool) for x in pair)):
+            raise ValueError(shape)
+        out[model] = (float(pair[0]), float(pair[1]))  # PRICE's own shape
+    return out
+
+
+def env_value(key, raw):
+    """One env var's text as the knob's type; everything else is a string."""
+    if key == "sixel":
+        return raw != "0"  # CCDASH_SIXEL=0 forces half blocks, as it always did
+    if key == "frame":
+        try:
+            return coerce(key, float(raw))
+        except ValueError:
+            raise ValueError("a number")
+    return raw
+
+
+def load_config(path=None):
+    """config.json into CONF, then the env vars over it. Where each knob came
+    from lands in SOURCE, what made no sense in COMPLAINTS - a broken file is
+    a complaint --doctor shows, never a reason not to start."""
+    path = path or CONFIG_FILE
+    CONF.update(DEFAULTS)
+    CONF["agents"], CONF["prices"] = list(DEFAULTS["agents"]), dict(DEFAULTS["prices"])
+    SOURCE.clear()
+    del COMPLAINTS[:]
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except OSError:
+        raw = {}  # no file yet: every default stands
+    except ValueError as exc:
+        COMPLAINTS.append("%s: not JSON - %s" % (os.path.basename(path), exc))
+        raw = {}
+    if not isinstance(raw, dict):
+        COMPLAINTS.append("%s: want a JSON object of settings" % os.path.basename(path))
+        raw = {}
+    if "theme" not in raw:  # 0.1.0 kept the theme in a one-line file of its own
+        try:
+            with open(THEME_FILE) as f:
+                raw["theme"] = f.read().strip()
+        except OSError:
+            pass
+    for k, v in raw.items():
+        if k not in DEFAULTS:
+            COMPLAINTS.append("%s: not a setting - see --config" % k)
+            continue
+        try:
+            CONF[k], SOURCE[k] = coerce(k, v), os.path.basename(path)
+        except ValueError as exc:
+            COMPLAINTS.append("%s: want %s" % (k, exc))
+    for k, var in ENVS.items():
+        text = os.environ.get(var)
+        if not text:
+            continue
+        try:
+            CONF[k], SOURCE[k] = env_value(k, text), "$" + var
+        except ValueError as exc:
+            COMPLAINTS.append("%s=%s: want %s" % (var, text, exc))
+    return CONF
+
+
+def update_config(**kw):
+    """Write these settings back, keeping what is already in the file - a
+    hand-edit made while ccdash ran is not something `t` gets to eat."""
+    try:
+        with open(CONFIG_FILE) as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw.update(kw)
+    write_json(CONFIG_FILE, raw, indent=2)  # a file people read and edit
+
+
+def apply_config():
+    """CONF into the globals the program reads. Once, from main(), before
+    anything has cached a path or a colour."""
+    global ROOT, DEPTH, CHIBI_ART, FRAME, SIXEL, REFRESH, BELL, HISTORY, MAX_CARDS
+    global WAIT_AFTER, IDLE_AFTER, CLAUDE, CODEX, OPENCODE, CREDS, SETTINGS, AGENTS
+    ROOT = os.path.realpath(os.path.expanduser(CONF["root"]))
+    DEPTH, FRAME, SIXEL = CONF["depth"], CONF["frame"], CONF["sixel"]
+    REFRESH, BELL, HISTORY = CONF["refresh"], CONF["bell"], CONF["history_days"]
+    MAX_CARDS, WAIT_AFTER, IDLE_AFTER = (CONF["max_cards"], CONF["wait_after"],
+                                         CONF["idle_after"])
+    CLAUDE = os.path.expanduser(CONF["claude_dir"]) or CLAUDE
+    CODEX = os.path.expanduser(CONF["codex_home"]) or CODEX
+    OPENCODE = os.path.expanduser(CONF["opencode_db"]) or OPENCODE
+    CREDS = os.path.join(CLAUDE, ".credentials.json")
+    SETTINGS = os.path.join(CLAUDE, "settings.json")
+    CHIBI_ART = os.path.expanduser(CONF["art"]) or os.path.join(CONFIG, "art.gif")
+    PRICE.update(CONF["prices"])
+    AGENTS = {n: a for n, a in AGENTS.items() if n in CONF["agents"]}
+    # AGENTS bakes the agent dirs into its globs at import: re-pointing one
+    # means rewriting its glob too, or the dashboard reads the old folder.
+    for n, pat in (("claude", os.path.join(CLAUDE, "projects", "*", "%s.jsonl")),
+                   ("codex", os.path.join(CODEX, "sessions", "*", "*", "*",
+                                          "rollout-*%s.jsonl")),
+                   ("opencode", OPENCODE + "#%s")):
+        if n in AGENTS:
+            AGENTS[n]["glob"] = pat
+
 
 # ----------------------------------------------------------------- themes
 
@@ -118,24 +299,10 @@ def load_themes(path=USER_THEMES):
             THEMES[name] = t
 
 
-def pick_theme():
-    try:
-        with open(THEME_FILE) as f:
-            saved = f.read().strip()
-    except OSError:
-        saved = ""
-    return os.environ.get("CCDASH_THEME") or saved
-
-
 def next_theme():
     names = sorted(THEMES)
     set_theme(names[(names.index(THEME) + 1) % len(names)])
-    try:
-        os.makedirs(os.path.dirname(THEME_FILE), exist_ok=True)
-        with open(THEME_FILE, "w") as f:
-            f.write(THEME + "\n")
-    except OSError:
-        pass
+    update_config(theme=THEME)
 
 
 ANSI = re.compile(r"\033\[[0-9;]*m")
@@ -427,7 +594,7 @@ def probe(buf):
 
 def ask_terminal():
     """Send the two queries, collect replies until DA1 lands or 0.5s pass."""
-    if os.environ.get("CCDASH_SIXEL") == "0":
+    if not SIXEL:
         return None
     sys.stdout.write("\033[16t\033[c")  # DA1 last: everyone answers it
     sys.stdout.flush()
@@ -456,25 +623,23 @@ def tick():
 _AT = {}
 
 
-def chibi_at(art, frame, off=0, height=1 << 16):
+def chibi_at(art, frame):
     """Just the chibi, cursor-placed where render() put it - `art` is the
     (rows, x) it returned, None when it laid none out: a frame tick redraws
-    the art, not the screen around it. Scrolled `off` rows, the half blocks
-    clip to the `height` rows on screen; sixel can't clip, so scrolled at all
-    it just blanks. Cached: this is the 8 fps path, and the blob is the same
-    one until something it is keyed on moves."""
+    the art, not the screen around it. The art sits in a column that never
+    scrolls, so it is always whole. Cached: this is the 8 fps path, and the
+    blob is the same one until something it is keyed on moves."""
     if not art:
         return ""
-    key = art, frame % nframes(), off, height, bool(TERM.sixel)
+    key = art, frame % nframes(), bool(TERM.sixel)
     if key not in _AT:
         if len(_AT) > 3 * nframes():
             _AT.clear()
         rows, x = art
         col = PAD_X + x + 1
-        out = R + "".join("\033[%d;%dH" % (PAD_Y + 1 + i - off, col) + l
-                          for i, l in enumerate(chibi_lines(rows, frame))
-                          if 0 <= i - off < height)
-        if TERM.sixel and not off:
+        out = R + "".join("\033[%d;%dH" % (PAD_Y + 1 + i, col) + l
+                          for i, l in enumerate(chibi_lines(rows, frame)))
+        if TERM.sixel:
             out += "\033[%d;%dH" % (PAD_Y + 1, col) + chibi_sixel(rows, frame)
         _AT[key] = out
     return _AT[key]
@@ -582,12 +747,13 @@ def limits(fetch=True):
     fetch=False reads the cache only - no network, ever."""
     st = load_limits()
     if fetch and time.time() - st["at"] >= st["wait"]:
-        try:
-            st.update(at=time.time(), ok_at=time.time(), data=fetch_limits(),
-                      err=None, wait=LIMITS_TTL)
-        except Exception as exc:
-            st.update(at=time.time(), err=why(exc),
-                      wait=min(LIMITS_MAX_WAIT, st["wait"] * 2 or LIMITS_TTL))
+        with T_FETCH:
+            try:
+                st.update(at=time.time(), ok_at=time.time(), data=fetch_limits(),
+                          err=None, wait=LIMITS_TTL)
+            except Exception as exc:
+                st.update(at=time.time(), err=why(exc),
+                          wait=min(LIMITS_MAX_WAIT, st["wait"] * 2 or LIMITS_TTL))
         write_json(LIMITS_CACHE, st)
     return (st["data"] or {}).get("limits") or [], st.get("err"), st.get("ok_at", 0)
 
@@ -850,13 +1016,13 @@ def save_scans(scans):
     write_json(SCAN_CACHE, {"v": SCAN_VERSION, "files": scans})
 
 
-def write_json(path, obj):
+def write_json(path, obj, indent=None):
     """Write-then-rename, so a second ccdash never reads half a file; a
     read-only home is not worth crashing over."""
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path + ".tmp", "w") as f:
-            json.dump(obj, f)
+            json.dump(obj, f, indent=indent)
         os.replace(path + ".tmp", path)
     except OSError:
         pass
@@ -1246,11 +1412,137 @@ def state(s):
     # A transcript can't see a permission prompt. With the --hook installed,
     # `hooked` says; without it (None), a tool call quiet for 60s reads as
     # one - and so does a slow Bash.
-    name = ("idle" if age >= 1800 else "error" if phase == "error"
+    name = ("idle" if age >= IDLE_AFTER else "error" if phase == "error"
             else "waiting" if hooked or phase == "done" or phase == "tool" and (
-                s.get("tool") in ASKS or hooked is None and age >= 60)
+                s.get("tool") in ASKS or hooked is None and age >= WAIT_AFTER)
             else "working" if age < 600 else "idle")  # 600: killed mid-turn
     return name, dict(STATES)[name]
+
+
+def counts(sessions):
+    """(state, colour, how many) for each state these sessions are in."""
+    return [(n, c, v) for n, c in STATES
+            for v in [sum(state(s)[0] == n for s in sessions)] if v]
+
+
+def worst(sessions):
+    """The state a card holding these sessions wears: waiting first - it wants you."""
+    names = {state(s)[0] for s in sessions}
+    return next((n for n in ("waiting", "error", "working") if n in names), "idle")
+
+
+# ------------------------------------------------------------------ repos
+
+def find_repos(root, depth=3):
+    """Git repositories under root: folders whose .git is a directory. A .git
+    file is a worktree or submodule - its repo's worktree list brings it in.
+    Hidden folders are skipped, and a repo is not looked inside."""
+    # ponytail: walked again every REFRESH (~50ms for a ~/ of 11 repos). Cache
+    # it by time if a big home makes that show.
+    out, todo = [], [(root, 0)]
+    while todo:
+        d, n = todo.pop()
+        try:
+            ents = list(os.scandir(d))
+        except OSError:
+            continue
+        if any(e.name == ".git" and e.is_dir() for e in ents):
+            out.append(d)
+        elif n < depth:
+            todo += [(e.path, n + 1) for e in ents
+                     if not e.name.startswith(".") and e.is_dir(follow_symlinks=False)]
+    return sorted(out)
+
+
+def git(repo, *args):
+    """(ok, what it printed) for a git command in repo: stderr when it failed."""
+    try:
+        p = subprocess.run(["git", "-C", repo] + list(args), capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    return p.returncode == 0, (p.stdout if p.returncode == 0 else p.stderr).strip()
+
+
+def parse_worktrees(text):
+    """`git worktree list --porcelain` -> worktree cards' data, the repo's own
+    checkout first. A detached HEAD has no branch; `gone` is one whose folder
+    went away (git calls it prunable)."""
+    wts = []
+    for line in text.splitlines():
+        k, _, v = line.partition(" ")
+        if k == "worktree":
+            wts.append({"kind": "wt", "id": v, "path": v, "branch": None, "gone": False})
+        elif k == "branch" and wts:
+            wts[-1]["branch"] = v[11:] if v.startswith("refs/heads/") else v
+        elif k == "prunable" and wts:
+            wts[-1]["gone"] = True
+    return wts
+
+
+def worktrees(repo):
+    """repo's worktrees, or just its own checkout when git can't say."""
+    ok, out = git(repo, "worktree", "list", "--porcelain")
+    return (parse_worktrees(out) if ok else []) or [
+        {"kind": "wt", "id": repo, "path": repo, "branch": None, "gone": False}]
+
+
+HOME = os.path.expanduser("~")
+
+
+def home(path):
+    return "~" + path[len(HOME):] if (path + os.sep).startswith(HOME + os.sep) else path
+
+
+def group(sessions, repos):
+    """Repo cards: `repos` holds each repo's worktrees, its own checkout first.
+    A session goes to the worktree holding its folder - the longest path, so a
+    worktree inside its repo keeps its own - and what no repo holds to an
+    "other" card, last. Repos with sessions come first, newest on top."""
+    out, where, other = [], [], []
+    for wts in repos:
+        path = wts[0]["path"]
+        r = {"kind": "repo", "id": path, "path": path, "wts": wts, "sessions": [],
+             "name": os.path.basename(path)}
+        for i, w in enumerate(wts):
+            w["main"], w["sessions"] = i == 0, []
+            where.append((w["path"], w, r))
+        out.append(r)
+    where.sort(key=lambda t: -len(t[0]))
+    for s in sessions:
+        cwd = s.get("cwd") or ""
+        hit = next(((w, r) for p, w, r in where
+                    if cwd == p or cwd.startswith(p.rstrip(os.sep) + os.sep)), None)
+        for bucket in ([hit[0]["sessions"], hit[1]["sessions"]] if hit else [other]):
+            bucket.append(s)
+    out.sort(key=lambda r: (min([s["age"] for s in r["sessions"]] or [float("inf")]),
+                            r["name"].lower()))
+    if other:
+        out.append({"kind": "repo", "id": "other", "path": None, "name": "other",
+                    "wts": [], "sessions": other})
+    return out
+
+
+def add_worktree(repo, branch):
+    """git worktree add beside the repo, as <repo>.<branch>: the branch if it
+    exists, else a new one off HEAD. Says what happened, in a line."""
+    # ponytail: runs on the paint thread, so a big checkout freezes the screen
+    # until it is done. A thread of its own if that gets long.
+    branch = branch.strip()
+    if not branch or branch.startswith("-"):
+        return "! not a branch name: " + branch
+    path = "%s.%s" % (repo, branch.replace("/", "-"))
+    have = git(repo, "rev-parse", "--verify", "--quiet", "refs/heads/" + branch)[0]
+    ok, out = git(repo, "worktree", "add", *([path, branch] if have else ["-b", branch, path]))
+    return "added " + home(path) if ok else "! " + (out.splitlines() or ["git failed"])[-1]
+
+
+def remove_worktree(repo, path):
+    """git worktree remove: git itself refuses one with changes or untracked
+    files. The branch stays."""
+    ok, out = git(repo, "worktree", "remove", path)
+    return ("removed %s, its branch kept" % home(path) if ok
+            else "! " + (out.splitlines() or ["git failed"])[-1])
 
 
 # ---------------------------------------------------------------- panels
@@ -1439,21 +1731,21 @@ def panel_chart(w, hours, chart, height=4):
 
 def panel_history(w, days):
     today = datetime.now().date()
-    dates = [today - timedelta(days=d) for d in range(13, -1, -1)]
+    dates = [today - timedelta(days=d) for d in range(HISTORY - 1, -1, -1)]
     vals = [days.get(d.isoformat(), 0.0) for d in dates]
     lab = 6
-    bw = max(1, (w - lab) // 14)
-    out = [rule("LAST 14 DAYS · %s" % money(sum(vals)), w)]
-    for i, row in enumerate(vbars(vals, w - lab, 4, 13)):
+    bw = max(1, (w - lab) // HISTORY)
+    out = [rule("LAST %d DAYS · %s" % (HISTORY, money(sum(vals))), w)]
+    for i, row in enumerate(vbars(vals, w - lab, 4, HISTORY - 1)):
         out.append(DIM + pad(cut(money(max(vals)), lab - 1) if i == 0 else "", lab) + row)
     names = "".join(d.strftime("%a")[0].ljust(bw) for d in dates)
     out.append(DIM + " " * lab + names[:w - lab] + R)
-    return out + [DIM + cut("avg %s/day" % money(sum(vals) / 14), w) + R, ""]
+    return out + [DIM + cut("avg %s/day" % money(sum(vals) / HISTORY), w) + R, ""]
 
 
 def middle(data, w, height, ui):
     """Stats column. The hourly chart grows into spare rows; when even its
-    smallest size won't fit, the 14-day history goes first."""
+    smallest size won't fit, the day history goes first."""
     base = panel_limits(w, data["lims"], data["lim_err"], data["lim_at"],
                         data.get("limits", ())) + panel_today(w, data)
     hist = panel_history(w, data["days"])
@@ -1493,16 +1785,113 @@ def card(s, w, picked=False):
         bar(pct, inner - len(ctx) - 2) + DIM + "  " + ctx + R,
         DIM + cut(badge.strip(), inner) + R,
     ]
+    return box(rows, w, picked, label)
+
+
+def box(rows, w, picked=False, label="idle"):
+    """Rows framed as a card, CARD_H tall: the pick's heavy rim, else a tint
+    of the state it is in."""
+    inner = w - 4
+    rows = (rows + [""] * CARD_H)[:CARD_H - 2]
     rim = {"working": mix(PAL["grn"], BG, 0.45), "waiting": mix(PAL["yel"], BG, 0.45),
            "error": mix(PAL["red"], BG, 0.45)}
     edge = ACC if picked else fg(rim[label]) if label in rim else BOR
-    tl, tr, bl, br, h, v = "┏┓┗┛━┃" if picked else "╭╮╰╯─│"  # run() finds ┏
+    tl, tr, bl, br, h, v = "┏┓┗┛━┃" if picked else "╭╮╰╯─│"
     body = [edge + v + " " + R + pad(r, inner) + edge + " " + v + R for r in rows]
     return ([edge + tl + h * (w - 2) + tr + R] + body
             + [edge + bl + h * (w - 2) + br + R])
 
 
 CARD_H = 10  # 8 rows + 2 borders; keep in step with card()
+
+
+def glyphs(sessions):
+    """● 1  ◐ 2: how many sessions are in each state, small enough for a card."""
+    return "  ".join(c + GLYPH[n] + " %d" % v for n, c, v in counts(sessions)) + R
+
+
+def repo_card(r, w, picked=False):
+    """A repo: where it is, its branch, the other worktrees, and its sessions."""
+    inner, ss = w - 4, r["sessions"]
+    age = ago(min(s["age"] for s in ss)) if ss else ""
+    rows = [pad(TXT + cut(r["name"], inner - len(age) - 1) + R, inner - len(age))
+            + DIM + age + R]
+    if r["path"]:
+        main, rest = r["wts"][0], r["wts"][1:]
+        rows += [DIM + cut(home(r["path"]), inner) + R,
+                 ACC + "⎇ " + MUT + cut(main["branch"] or "detached", inner - 2) + R]
+        # the other worktrees, each with how many sessions it holds
+        lines = [(w_["branch"] or home(w_["path"]), len(w_["sessions"]), w_["gone"])
+                 for w_ in rest]
+    else:  # "other": sessions in no repo under ROOT - the newest few, by name
+        rows += [DIM + cut("in no repo under " + home(ROOT), inner) + R, ""]
+        lines = [(s["title"], 0, False) for s in ss]
+    for name, n, gone in lines if len(lines) <= 3 else lines[:2]:
+        tag = " gone" if gone else " ·%d" % n if n else ""
+        rows.append(DIM + "├ " + MUT + cut(name, inner - 2 - len(tag)) + DIM + tag + R)
+    if len(lines) > 3:
+        rows.append(DIM + "└ +%d more" % (len(lines) - 2) + R)
+    rows = (rows + [""] * 6)[:6]
+    cost = sum(s.get("cost", 0.0) for s in ss)
+    rows += [glyphs(ss) if ss else DIM + "no sessions" + R,
+             DIM + cut("%s today · %d session%s" % (money(cost), len(ss),
+                                                    "" if len(ss) == 1 else "s"), inner) + R]
+    return box(rows, w, picked, worst(ss))
+
+
+ROW_PICK = "▸"  # the picked row wears it; list_of() scrolls the list to it
+
+
+def tail(bits, room, drop=0):
+    """`bits` joined two cells apart, flush right in a row: while they don't
+    fit `room`, the one at `drop` goes - the front for a session's model, the
+    back for a worktree's age. Empty ones never count; "" when none is left.
+    The gap before it comes with it, so the row is `room` wide either way."""
+    bits = [b for b in bits if vlen(b)]
+    while bits and vlen("  ".join(bits)) > room:
+        bits.pop(drop)
+    return "  " + "  ".join(bits) if bits else ""
+
+
+def wt_row(wt, w, picked=False):
+    """A worktree, as a list row: its branch and folder, and the states of
+    the sessions it holds."""
+    ss, inner = wt["sessions"], w - 2
+    right = tail([glyphs(ss) if ss else DIM + "no sessions" + R,
+                  DIM + ("main" if wt["main"] else "gone" if wt["gone"] else "") + R,
+                  DIM + (ago(ss[0]["age"]).rjust(3) if ss else "") + R], inner // 2, -1)
+    room = inner - vlen(right)
+    branch = cut(wt["branch"] or "detached", max(1, room - 2))
+    left = ACC + "⎇ " + (ACC if picked else TXT) + branch + R
+    rest = room - 2 - cells(branch)
+    if rest > 8:  # the folder, when the branch left room for it
+        left += DIM + "  " + cut(home(wt["path"]), rest - 2) + R
+    return (ACC + ROW_PICK + " " if picked else "  ") + pad(left, room) + right
+
+
+def session_row(s, w, picked=False, tee="└"):
+    """A session, as a list row under its worktree: what it is on, what it is
+    doing, and the numbers its card keeps in the corners."""
+    label, col = state(s)
+    inner = w - 4  # the pick's marker, then a step in under the worktree
+    cap = s.get("cap") or (1000000 if "1m" in (s["model"] or "").lower() else 200000)
+    agent = s.get("agent", "claude")
+    badge = ("" if agent == "claude" else agent + " ") + model_name(s["model"])
+    right = tail([DIM + cut(badge, 20) + R, DIM + money(s.get("cost", 0.0)) + R,
+                  DIM + "%d%%" % (100.0 * s["ctx"] / cap) + R,
+                  DIM + ago(s["age"]).rjust(3) + R], inner // 2)
+    room = inner - vlen(right)
+    # a wide row says what the agent is doing too, so the title takes two thirds
+    doing = room >= 36
+    title = cut(s["title"], max(1, room * 2 // 3 if doing else room - 2))
+    left = (col + GLYPH[label] + " "
+            + (ACC if picked else MUT if label == "idle" else TXT) + title + R)
+    rest = room - 2 - cells(title)
+    if doing and rest > 6:  # mid tool call: say which, else the last words
+        left += (ACC + " › " + cut(s["tool"], rest - 3) if s.get("tool")
+                 else DIM + " · " + cut(s.get("reply") or "", rest - 3)) + R
+    return ((ACC + ROW_PICK + " " if picked else "  ") + DIM + tee + " " + R
+            + pad(left, room) + right)
 
 
 def side_by_side(panels, gap):
@@ -1529,12 +1918,17 @@ class UI:
         self.sel = None  # id of the session run() has picked out
         self.grid = (1, 0)  # (columns, cards) grid_of() laid out, for moving sel
         self.chart = 0  # which of METRICS the hourly chart shows
-        self.off = 0  # rows scrolled past
+        self.off = 0  # cards/rows scrolled past, inside the grid column alone
+        self.repo = None  # id of the repo opened, None on the repo list
         self.find = ""  # the / filter
-        self.typing = False  # typing it
+        self.name = ""  # the branch a new worktree gets
+        self.typing = False  # typing into a prompt: "/" (find) or "branch" (name)
         self.helping = False  # the help box is up
+        self.perf = profiling()  # the cost HUD is up; --profile opens it on start
         self.follow = False  # scroll the picked card into view on the next draw
-        self.confirm = 0
+        self.more = False  # the grid ran past its room: the footer says J/K
+        self.confirm = None  # (question, what y does - None quits) the footer asks
+        self.msg = ""  # what the last worktree command did; "! ..." when it failed
 
 
 @functools.lru_cache(maxsize=64)
@@ -1563,30 +1957,110 @@ def fit_clock(budget, height, frame=0):
     return panel_clock(clock_rows(budget, height), frame)
 
 
-def grid_of(sessions, width, rows, ui):
-    """Card grid sized to fill `width`, under a tally of session states."""
+def head_of(title, sessions, width):
+    """A screen's header: its title, how many sessions under it are in each
+    state, then a hairline out to the column edge."""
+    shown = counts(sessions)
+    tally = "  ".join("%s %d %s" % (GLYPH[n], v, n) for n, _, v in shown)
+    head = MUT + title + "  " + "  ".join("%s%s %d %s" % (c, GLYPH[n], v, n)
+                                          for n, c, v in shown)
+    lead = cells(title) + 2
+    if lead + cells(tally) + 2 <= width:
+        return head + " " + BOR + "─" * (width - lead - cells(tally) - 1) + R
+    return rule(title + "  " + tally, width)
+
+
+def scrolled(head, body, height, ui, pick=None):
+    """`head` pinned, `body` cut to the rows left under it and started at
+    ui.off: the cards are the only thing that scrolls - the clock, the stats
+    and the tally beside them hold still. `pick` is the (row, rows) of the
+    picked card, which ui.follow drags back into view. Sets ui.more, which
+    the footer turns into the J/K hint."""
+    room = max(1, height - len(head))
+    if pick and ui.follow:
+        top, tall = pick
+        ui.off = min(max(ui.off, top + tall - room), top)
+    ui.follow = False
+    ui.off = max(0, min(ui.off, len(body) - room))
+    ui.more = len(body) > room
+    return head + body[ui.off:ui.off + room]
+
+
+def grid_of(repos, width, height, ui, title="REPOS", empty="nothing here"):
+    """Every repo card, in a grid sized to fill `width`, under a tally of the
+    states of the sessions they hold. Taller than `height`, the cards scroll
+    under the tally, which stays."""
     cols = max(1, (width + GAP) // (MIN_CW + GAP))
     cw, wide = divmod(width - (cols - 1) * GAP, cols)  # `wide` cards get +1 cell
     if cw >= MAX_CW:
         cw, wide = MAX_CW, 0
-    picked = sessions[:cols * rows]
-    ui.grid = (cols, len(picked))
-    shown = [(n, c, v) for n, c in STATES
-             for v in [sum(state(s) == (n, c) for s in picked)] if v]
-    tally = "  ".join("%s %d %s" % (GLYPH[n], v, n) for n, _, v in shown)
-    head = MUT + "SESSIONS  " + "  ".join("%s%s %d %s" % (c, GLYPH[n], v, n)
-                                          for n, c, v in shown)
-    if 10 + cells(tally) + 2 <= width:
-        head += " " + BOR + "─" * (width - 10 - cells(tally) - 1) + R
-    else:
-        head = rule("SESSIONS  " + tally, width)
-    out = [head, ""] + ([] if picked else [DIM + "no sessions" + R])
-    for r in range(rows):
-        band = [card(s, cw + (i < wide), ui.sel is not None and s.get("id") == ui.sel)
-                for i, s in enumerate(picked[r * cols:(r + 1) * cols])]
-        if band:
-            out += side_by_side(band, GAP) + [""]
-    return out
+    ui.grid = (cols, len(repos))
+    head = [head_of(title, [s for r in repos for s in r["sessions"]], width), ""]
+    out, pick = [] if repos else [DIM + empty + R], None
+    for r in range(0, len(repos), cols):
+        picks = [ui.sel is not None and it["id"] == ui.sel for it in repos[r:r + cols]]
+        if any(picks):  # a whole band of cards has to land on screen, not a row of one
+            pick = (len(out), CARD_H)
+        band = [repo_card(it, cw + (i < wide), picks[i])
+                for i, it in enumerate(repos[r:r + cols])]
+        out += side_by_side(band, GAP) + [""]
+    return scrolled(head, out, height, ui, pick)
+
+
+def list_of(items, width, height, ui, title, empty="nothing here"):
+    """An opened repo: a row per worktree, each followed by a row per session
+    it holds, worktrees a blank line apart. Taller than `height`, the rows
+    scroll under the title - one row at a time, not one card."""
+    ui.grid = (1, len(items))
+    head = [head_of(title, [it for it in items if not it.get("kind")], width), ""]
+    out, pick = [] if items else [DIM + empty + R], None
+    for i, it in enumerate(items):
+        picked = ui.sel is not None and it.get("id") == ui.sel
+        if it.get("kind") == "wt":
+            out += ([""] if out and out[-1] else []) + [wt_row(it, width, picked)]
+        else:
+            more = i + 1 < len(items) and not items[i + 1].get("kind")  # another session
+            out.append(session_row(it, width, picked, "├" if more else "└"))
+        if picked:
+            pick = (len(out) - 1, 1)
+    return scrolled(head, out, height, ui, pick)
+
+
+def opened(data, ui):
+    """The repo ui.repo opened, while the scan still has it."""
+    return next((r for r in data.get("repos", ()) if r["id"] == ui.repo), None)
+
+
+def words(it):
+    """What the / filter looks through: a session's title, project, branch and
+    prompt; a worktree's branch and folder; a repo's worktrees and sessions."""
+    if it.get("kind") == "repo":
+        return " ".join([it["name"].lower()] + [words(x) for x in it["wts"] + it["sessions"]])
+    parts = ((it["branch"], it["path"]) if it.get("kind") == "wt"
+             else (it["title"], it["project"], it["branch"], it["prompt"]))
+    return " ".join(filter(None, parts)).lower()
+
+
+def items(data, ui):
+    """What the screen shows: the repos, or the opened one's worktrees, each
+    followed by its sessions - on "other", just sessions. Filtered by ui.find."""
+    r = opened(data, ui)
+    its = (data.get("repos", []) if r is None
+           else sum(([w] + w["sessions"] for w in r["wts"]), []) or r["sessions"])
+    q = ui.find.lower()
+    return [it for it in its if q in words(it)] if q else its
+
+
+def grid(data, width, height, ui):
+    """What render() lays out beside the stats: the repo cards, or an opened
+    repo's worktrees and sessions as a list, `height` rows of it at most -
+    the scroll lives in here. run() hands it the filtered view."""
+    r = opened(data, ui)
+    view = data["view"] if "view" in data else items(data, ui)
+    if r is None:
+        return grid_of(view, width, height, ui, "REPOS", "nothing matches" if ui.find
+                       else "no repos under " + home(ROOT))
+    return list_of(view, width, height, ui, "‹ " + r["name"], "nothing matches")
 
 
 def collect():
@@ -1598,10 +2072,10 @@ def collect():
                                        microsecond=0).timestamp()
     meta = {p: (m, size) for p, m, size in transcripts()}
     files = sorted(meta, key=lambda p: -meta[p][0])
-    # ponytail: the 14-day history parses ~270MB (~1.5s) whenever SCAN_CACHE
+    # ponytail: the day history parses ~270MB (~1.5s) whenever SCAN_CACHE
     # is cold, then only what was appended to files whose mtime moved.
-    recent = [f for f in files if meta[f][0] >= day_start - 13 * 86400]
-    # the grid shows what fits; the rest is what the / filter searches.
+    recent = [f for f in files if meta[f][0] >= day_start - (HISTORY - 1) * 86400]
+    # the newest sessions and today's go on cards, under their repos.
     # sidechain/subagent logs have no assistant turn - nothing to show on a card
     pool = set(files[:MAX_CARDS * 3]) | set(recent)
     picked = [s for s in (scan(f, *meta[f], day_start) for f in files if f in pool)
@@ -1630,7 +2104,8 @@ def collect():
     flush_scans()
     return {"sessions": picked, "totals": totals, "cost": cost, "hours": hours,
             "days": days, "by_model": by_model, "nsess": nsess, "at": time.time(),
-            "limits": codex_limits(rl[1]) if rl else []}
+            "limits": codex_limits(rl[1]) if rl else [],
+            "repos": group(picked, [worktrees(p) for p in find_repos(ROOT, DEPTH)])}
 
 
 def snapshot():
@@ -1653,29 +2128,33 @@ def find_session(sid):
 
 
 def render(data, width, height, ui, frame=0):
-    """Pure layout: same data, any terminal. May overflow height - we scroll.
-    Returns the lines and where the art landed, (rows, x) or None, so a frame
-    tick can redraw it alone."""
-    mw = max(MIN_MW, min(MAX_MW, width // 4))
+    """Pure layout bar the scroll: same data, any terminal, `height` rows -
+    what runs past it is the grid's own, and only the grid scrolls. Returns
+    the lines and where the art landed, (rows, x) or None, so a frame tick
+    can redraw it alone."""
+    with T_RENDER:
+        mw = max(MIN_MW, min(MAX_MW, width // 4))
+        # stacked, the stats sit over the cards and no longer scroll away, so
+        # they stop a card's worth of rows short: that is what the grid scrolls in
+        top_h = max(1, height - CARD_H - 2)
 
-    if width < 60:  # no room for the art alongside anything
-        mid = middle(data, mw, height - CARD_H - 4, ui)
-        rows = max(1, (height - len(mid) - 4) // (CARD_H + 1))
-        return mid + grid_of(data["sessions"], width, rows, ui), None
+        if width < 60:  # no room for the art alongside anything
+            mid = middle(data, mw, height - CARD_H - 4, ui)[:top_h]
+            return mid + grid(data, width, height - len(mid), ui), None
 
-    budget = max(20, width // 3)
-    left, art = fit_clock(budget, height, frame), (clock_rows(budget, height), 0)
-    if width < 100:  # art and stats share the top, cards get the full width
-        mid = middle(data, mw, height - CARD_H - 4, ui)
-        top = side_by_side([left, mid], GAP)
-        rows = max(1, (height - len(top) - 4) // (CARD_H + 1))
-        return top + [""] + grid_of(data["sessions"], width, rows, ui), art
+        budget = max(20, width // 3)
+        if width < 100:  # art and stats share the top, cards get the full width
+            rows = clock_rows(budget, top_h)  # the art fits the top, not the screen
+            top = side_by_side(
+                [panel_clock(rows, frame),
+                 middle(data, mw, height - CARD_H - 4, ui)[:top_h]], GAP) + [""]
+            return top + grid(data, width, height - len(top), ui), (rows, 0)
 
-    mid = middle(data, mw, height, ui)
-    lw = max(vlen(l) for l in left)
-    rows = max(1, (height - 2) // (CARD_H + 1))
-    grid = grid_of(data["sessions"], width - lw - mw - 2 * GAP, rows, ui)
-    return side_by_side([left, mid, grid], GAP), art
+        left, art = fit_clock(budget, height, frame), (clock_rows(budget, height), 0)
+        mid = middle(data, mw, height, ui)[:height]  # more limits than rows: the rest
+        lw = max(vlen(l) for l in left)              # waits for a taller window
+        return side_by_side([left, mid, grid(data, width - lw - mw - 2 * GAP, height, ui)],
+                            GAP), art
 
 
 SIDE_W = 40  # cells tmux gives the column beside a resumed claude, padding in
@@ -1723,7 +2202,9 @@ def selftest():
     import tempfile
 
     global SCAN_CACHE, _SCAN, _SCAN_DIRTY, _REST  # swapped out by the checks below
-    global _read, _TTY
+    global _read, _TTY, CONFIG_FILE, THEME_FILE
+    global ROOT, DEPTH, MAX_CARDS, HISTORY, WAIT_AFTER, IDLE_AFTER, SIXEL, BELL
+    global FRAME, REFRESH, CLAUDE, CODEX, OPENCODE, CREDS, SETTINGS, CHIBI_ART, AGENTS
 
     assert vlen(TXT + "abc" + R) == 3
     assert vlen(pad(ACC + "hi" + R, 6)) == 6
@@ -1938,14 +2419,17 @@ def selftest():
     assert ACC == fg((255, 0, 0)) and TXT == fg(rgb(THEMES["ccdash"]["txt"])), \
         "missing roles come from ccdash"
     del THEMES["half"]
-    global THEME_FILE
-    real_file, THEME_FILE = THEME_FILE, tempfile.mktemp()
+    real_file, CONFIG_FILE = CONFIG_FILE, tempfile.mktemp()
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"depth": 2}, f)
     set_theme("ccdash")
     next_theme()
     assert THEME == sorted(THEMES)[(sorted(THEMES).index("ccdash") + 1) % len(THEMES)]
-    assert open(THEME_FILE).read().strip() == THEME, "t must persist"
-    os.unlink(THEME_FILE)
-    THEME_FILE = real_file
+    with open(CONFIG_FILE) as f:
+        kept = json.load(f)
+    assert kept == {"depth": 2, "theme": THEME}, "t must persist, and eat nothing else"
+    os.unlink(CONFIG_FILE)
+    CONFIG_FILE = real_file
     set_theme("ccdash")
 
     px = [[(1, 2, 3), None], [None, (4, 5, 6)]]
@@ -2009,6 +2493,11 @@ def selftest():
         assert got.getpixel((4, 0)) == BG, got.getpixel((4, 0))
         set_theme("ccdash")
         assert art_frames()[0].getpixel((4, 0)) == BG, "re-themed without re-keying"
+        # the art column never scrolls, so the sixel is always the whole frame
+        TERM.sixel = (2, 4)  # 6 rows of 4 px: the 5x5 dots grow to 24x24
+        assert '"1;1;24;24' in chibi_at((6, 4), 0), "every row of it, every time"
+        TERM.sixel = None
+        clear_art()
         os.unlink(CHIBI_ART)
         _KEYED.pop(CHIBI_ART)
 
@@ -2037,9 +2526,6 @@ def selftest():
     assert at(chibi_at((6, 4), 1)) == [(str(PAD_Y + 1 + i), str(PAD_X + 5)) for i in range(6)]
     assert chibi_lines(6, 1)[5] in chibi_at((6, 4), 1)
     assert chibi_at((6, 4), 1) is chibi_at((6, 4), 1), "the 8 fps blob is cached, not rebuilt"
-    assert at(chibi_at((6, 4), 1, off=2, height=3)) == [(str(PAD_Y + 1 + i), str(PAD_X + 5))
-                                                        for i in range(3)], \
-        "scrolled, the art clips to what is on screen"
     assert chibi_at(None, 1) == "", "no art laid out (help, narrow): nothing to draw"
     clear_art()
     assert not _AT and not _CHIBI_CACHE and not _SIXELS, "clear_art() drops every art cache"
@@ -2277,11 +2763,115 @@ def selftest():
     assert cut("abcdef", 4) == "abc…", "ascii truncation unchanged"
 
     ui = UI()
-    assert grid_of([_stub()] * 6, 30, 2, ui)[2].count("╭") == 1, "one narrow column"
-    assert ui.grid == (1, 2), "grid_of hands run() the grid it laid out"
-    wide = grid_of([_stub()] * 6, 120, 2, ui)
-    assert ui.grid == (3, 6) and wide[2].count("╭") == 3, "cards must multiply on a wide grid"
+
+    # repos: a .git folder is one, a .git file (a worktree) and hidden folders
+    # aren't, a repo isn't looked inside, and the walk stops 3 levels down
+    tree = tempfile.mkdtemp()
+    for d in ("a/.git", "a/sub/.git", "b/c/.git", ".hid/r/.git", "w", "1/2/3/.git",
+              "1/2/3/4/.git"):
+        os.makedirs(os.path.join(tree, d))
+    open(os.path.join(tree, "w", ".git"), "w").close()
+    assert find_repos(tree) == [os.path.join(tree, p) for p in ("1/2/3", "a", "b/c")], \
+        find_repos(tree)
+    porcelain = ("worktree /r\nHEAD 1\nbranch refs/heads/main\n\n"
+                 "worktree /r.feat\nHEAD 2\nbranch refs/heads/feat/x\n\n"
+                 "worktree /tmp/r.gone\nHEAD 3\ndetached\nprunable gitdir points nowhere\n")
+    wts = parse_worktrees(porcelain)
+    assert [(w["path"], w["branch"], w["gone"]) for w in wts] == [
+        ("/r", "main", False), ("/r.feat", "feat/x", False), ("/tmp/r.gone", None, True)], wts
+    sess = [dict(_stub(), id=i, cwd=c, age=a) for i, c, a in (
+        ("in", "/r/src", 50), ("wt", "/r.feat", 9), ("near", "/rr", 1), ("none", None, 2))]
+    other_wts = [{"kind": "wt", "id": "/q", "path": "/q", "branch": "main", "gone": False}]
+    g = group(sess, [other_wts, wts])
+    assert [r["id"] for r in g] == ["/r", "/q", "other"], "newest repo first, 'other' last"
+    assert [s["id"] for s in g[0]["sessions"]] == ["in", "wt"]
+    assert [[s["id"] for s in w["sessions"]] for w in g[0]["wts"]] == [["in"], ["wt"], []], \
+        "the longest worktree path holds a session; /rr is not in /r"
+    assert [s["id"] for s in g[2]["sessions"]] == ["near", "none"]
+    assert g[0]["wts"][0]["main"] and not g[0]["wts"][1]["main"]
+    data = {"repos": g}
+    assert items(data, ui) == g, "no repo open: the repos"
+    ui.repo = "/r"
+    assert [it["id"] for it in items(data, ui)] == ["/r", "in", "/r.feat", "wt", "/tmp/r.gone"], \
+        "a worktree, then its sessions"
+    ui.find = "feat"
+    assert [it["id"] for it in items(data, ui)] == ["/r.feat"], "/ filters inside a repo too"
+    ui.repo, ui.find = "other", ""
+    assert [it["id"] for it in items(data, ui)] == ["near", "none"], "'other' is just sessions"
+    ui.repo, ui.find = None, "feat"
+    assert [r["id"] for r in items(data, ui)] == ["/r"], "a repo matches by its branches"
+    ui.find = ""
+    for picked in (False, True):  # a repo card is as tall as a session's
+        out = repo_card(g[0], 34, picked)
+        assert len(out) == CARD_H and all(vlen(l) == 34 for l in out), out
+    tall = 2 + 6 * (CARD_H + 1)  # room for six bands: nothing scrolls
+    narrow = grid_of([g[0]] * 6, 30, tall, ui)
+    assert narrow[2].count("╭") == 1, "one narrow column"
+    assert ui.grid == (1, 6), "grid_of hands run() the grid it laid out"
+    assert sum(l.count("╭") for l in narrow) == 6, "every card, taller than a screen or not"
+    assert not ui.more, "all six fit: nothing to scroll"
+    wide = grid_of([g[0]] * 7, 120, tall, ui)
+    assert ui.grid == (3, 7) and wide[2].count("╭") == 3, "cards must multiply on a wide grid"
     assert vlen(wide[2]) == 120, "cards must fill the row, no ragged gutter"
+    assert len(wide) == 2 + 3 * (CARD_H + 1), "a short last row still gets its band"
+    assert any("other" in l for l in grid_of(g, 120, tall, ui, "REPOS")), "repo cards carry names"
+
+    # the cards are all that scrolls: the tally over them is pinned to the top
+    room = 2 + CARD_H  # the tally, then one band of the three
+    ui.off = 3
+    short = grid_of([g[0]] * 7, 120, room, ui)
+    assert len(short) == room and short[:2] == wide[:2], "the tally stays where it is"
+    assert short[2:] == wide[5:5 + CARD_H], "the cards start ui.off rows in"
+    assert ui.more, "there are cards past the fold: the footer says so"
+    ui.off = 999  # the scroll stops with the last band on screen, not past it
+    assert grid_of([g[0]] * 7, 120, room, ui)[2:] == wide[-CARD_H:]
+    assert ui.off == 3 * (CARD_H + 1) - CARD_H
+    ui.sel, ui.off, ui.follow = "other", 0, True  # the pick two bands down, at 1 column
+    band = grid_of(g, 30, room, ui)
+    assert (ui.off, ui.follow) == (2 * (CARD_H + 1), False), "follow scrolls the pick into view"
+    assert any("other" in l for l in band), "the picked card is the one on screen"
+    ui.sel, ui.off = None, 0
+
+    # an opened repo is a list: a row per worktree, its sessions stepped in under it
+    ui.repo, ui.sel = "/r", "wt"
+    view = items(data, ui)
+    rows = list_of(view, 80, 99, ui, "‹ r")
+    assert ui.grid == (1, 5), "list_of hands run() one card-wide column"
+    for w in (34, 40, 80, 200):
+        assert {vlen(l) for l in list_of(view, w, 99, ui, "‹ r") if l} == {w}, w
+    plain = [ANSI.sub("", l) for l in rows if l]
+    assert sum(l.startswith(("  ⎇", "▸ ⎇")) for l in plain) == 3, "a row per worktree"
+    assert [l for l in plain if "└ ●" in l or "├ ●" in l] and \
+        sum(ROW_PICK in l for l in plain) == 1, "its sessions under it, the pick marked"
+    assert any(ROW_PICK + " └ ●" in l for l in plain), "the picked session, a row of its own"
+    assert any("main" in l and "/r" in l for l in plain), "the repo's own checkout says so"
+    assert any("gone" in l for l in plain), "so does a worktree whose folder went"
+    assert len(rows) == 2 + 5 + 2, "worktrees a blank line apart, none before the first"
+    # the rows scroll under the pinned title, the pick dragged back onto the screen
+    ui.off, ui.follow = 0, True
+    win = list_of(view, 80, 5, ui, "‹ r")
+    assert (ui.off, ui.follow) == (2, False), "the picked row, just on screen"
+    assert len(win) == 5 and win[:2] == rows[:2] and win[2:] == rows[4:7]
+    assert ui.more, "more list than room"
+    ui.repo, ui.sel, ui.off = None, None, 0
+    if shutil.which("git"):  # the real thing: add, list, refuse, remove
+        repo = os.path.join(tree, "proj")
+        os.makedirs(repo)
+        for cmd in (["init", "-q", "-b", "main"],
+                    ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+                     "commit", "-q", "--allow-empty", "-m", "x"]):
+            assert git(repo, *cmd)[0], cmd
+        assert add_worktree(repo, "feat/y") == "added " + home(repo + ".feat-y")
+        assert add_worktree(repo, "-x").startswith("! "), "no options for branch names"
+        assert add_worktree(repo, "feat/y").startswith("! "), "git says why, in a line"
+        assert [w["branch"] for w in worktrees(repo)] == ["main", "feat/y"]
+        open(os.path.join(repo + ".feat-y", "dirty"), "w").close()
+        assert remove_worktree(repo, repo + ".feat-y").startswith("! "), "git keeps a dirty one"
+        os.remove(os.path.join(repo + ".feat-y", "dirty"))
+        assert remove_worktree(repo, repo + ".feat-y").startswith("removed ")
+        assert [w["branch"] for w in worktrees(repo)] == ["main"]
+        assert add_worktree(repo, "feat/y").startswith("added "), "an existing branch, checked out"
+    shutil.rmtree(tree, ignore_errors=True)
 
     LIMITS_CACHE = tempfile.mktemp(suffix=".json")
     fetch_limits = lambda: {"limits": [{"kind": "session", "percent": 4}]}
@@ -2290,10 +2880,12 @@ def selftest():
     assert any("CLAUDE 5-HOUR" in l for l in out) and any("CODEX 5-HOUR" in l for l in out), \
         "two agents' limits: each says whose"
     assert {s["agent"] for s in fake["sessions"]} == {"claude", "codex"}
-    assert sum(any(t in ANSI.sub("", l) for l in out) for t in ("WORKING", "WAITING", "ERROR")) == 3
+    assert sum(any(" " + t in ANSI.sub("", l) for l in out)
+               for t in ("working", "waiting", "error")) == 3, "the repos' tally, every state"
     for w, h in ((40, 20), (60, 24), (80, 24), (100, 30), (120, 34), (200, 60)):
         out, art = render(fake, w, h, ui, w // 20)  # a different art frame at each size
         assert all(vlen(l) <= w for l in out), (w, h, max(vlen(l) for l in out))
+        assert len(out) <= h, (w, h, len(out))  # nothing but the grid scrolls: it must fit
         assert any("╭" in l for l in out), "every size must still show a card"
         assert art is None if w < 60 else art[1] == 0, "the art, where chibi_at() draws it"
     assert any("LAST 14 DAYS" in l for l in render(fake, 200, 60, ui)[0])
@@ -2306,20 +2898,36 @@ def selftest():
     set_theme("ccdash")
     for w in (20, 60, 120):
         assert vlen(footer(w, time.time(), True, ui)) == w, w
-        ui.find, ui.typing = "x" * 200, True
+        ui.find, ui.typing = "x" * 200, "/"
         assert vlen(footer(w, time.time(), True, ui)) == w, w
-        ui.sel, ui.find, ui.typing = "t", "你好", False
+        ui.name, ui.typing = "y" * 200, "branch"
+        assert vlen(footer(w, time.time(), True, ui)) == w, w
+        ui.sel, ui.find, ui.typing, ui.repo = "t", "你好", False, "/r"
         assert vlen(footer(w, time.time(), False, ui)) == w, w
-        ui.sel, ui.find = None, ""
-    ui.confirm = 2
-    assert "close 2 agent windows" in footer(40, time.time(), False, ui)
-    ui.confirm = 0
+        ui.sel, ui.find, ui.repo = None, "", None
+    ui.confirm = ("close 2 agent windows?", None)
+    assert "close 2 agent windows? y/n" in footer(40, time.time(), False, ui)
+    new = window_cmd("u1", "/w")  # a new claude: named by the id it will write, in /w
+    assert new[:5] == ["new-window", "-n", "u1", "-c", "/w"] and new[-1].endswith("--new u1")
+    ui.confirm = ("remove worktree " + "/long" * 30 + "?", None)
+    assert ANSI.sub("", footer(40, time.time(), False, ui)).rstrip().endswith("y/n"), \
+        "a long ask keeps its y/n"
+    ui.confirm = None
     err = footer(40, time.time(), False, ui, error="boom")
     assert "boom" in err and vlen(err) == 40, "the worker's error takes the stamp's place"
-    ui.sel = fake["sessions"][0]["id"]
+    ui.msg = "added ~/x"
+    said = footer(60, time.time(), False, ui, error="boom")
+    assert "added ~/x" in said and "boom" not in said, "a worktree command's word comes first"
+    ui.msg = ""
+    ui.sel = fake["repos"][0]["id"]
     assert any("┏" in l for l in render(fake, 120, 34, ui)[0]), "the picked card stands out"
     ui.sel = None
-    assert any("no sessions" in l for l in render(dict(fake, sessions=[]), 120, 34, ui)[0])
+    assert any("no repos under" in l for l in render(dict(fake, repos=[]), 120, 34, ui)[0])
+    ui.repo = fake["repos"][0]["id"]
+    out = [ANSI.sub("", l) for l in render(fake, 120, 34, ui)[0]]
+    assert any("‹ " + fake["repos"][0]["name"] in l for l in out) and any("⎇" in l for l in out), \
+        "an open repo: its name up top, its worktrees"
+    ui.repo = None
     assert all(vlen(l) <= 80 for l in help_box(80, 30))
     one = dict(_stub(), hours=fake["hours"])  # read_session always fills hours
     assert "unavailable" in "".join(render_side(one, 40, 50)[0]), "no lims: nothing to show"
@@ -2524,6 +3132,96 @@ def selftest():
     assert w.snap["error"].startswith("ZeroDivisionError"), "no step() kills the thread"
     TERM.poll = real_poll
 
+    # settings: the file says what you like, the env beats it for one run
+
+    def refuses(key, val):
+        try:
+            coerce(key, val)
+        except ValueError:
+            return True
+        return False
+
+    def write_cfg(obj):
+        with open(cfg, "w") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    assert coerce("depth", 99) == 8 and coerce("depth", 0) == 1, "RANGE clamps"
+    assert coerce("frame", 9) == 5.0 and isinstance(coerce("frame", 9), float), \
+        "clamped, and still the type its default has"
+    assert refuses("bell", "yes") and refuses("depth", True) and refuses("agents", ["nope"])
+
+    was = (dict(CONF), dict(SOURCE), list(COMPLAINTS), ROOT, DEPTH, MAX_CARDS, HISTORY,
+           WAIT_AFTER, IDLE_AFTER, SIXEL, BELL, FRAME, REFRESH, CLAUDE, CODEX, OPENCODE,
+           CREDS, SETTINGS, CHIBI_ART, AGENTS, dict(PRICE))
+    env_was = {v: os.environ.pop(v) for v in set(ENVS.values()) if v in os.environ}
+    real_theme_file, THEME_FILE = THEME_FILE, tempfile.mktemp()  # nothing to migrate
+    cfg = tempfile.mktemp()
+
+    write_cfg({"theme": "nord", "bogus": 1, "frame": "x"})
+    load_config(cfg)
+    assert CONF["theme"] == "nord" and SOURCE["theme"] == os.path.basename(cfg)
+    assert len(COMPLAINTS) == 2 and any("bogus" in c for c in COMPLAINTS) \
+        and any(c.startswith("frame:") for c in COMPLAINTS), COMPLAINTS
+    os.environ["CCDASH_THEME"] = "dracula"
+    load_config(cfg)
+    assert CONF["theme"] == "dracula" and SOURCE["theme"] == "$CCDASH_THEME", \
+        "an env var beats the file"
+    del os.environ["CCDASH_THEME"]
+    write_cfg("not json")
+    load_config(cfg)
+    assert CONF == dict(DEFAULTS) and len(COMPLAINTS) == 1, \
+        "a broken config must not stop the dashboard"
+    write_cfg({"depth": 2})
+    with open(THEME_FILE, "w") as f:
+        f.write("nord\n")
+    load_config(cfg)
+    assert CONF["theme"] == "nord", "0.1.0's own theme file still counts"
+    os.unlink(THEME_FILE)
+
+    tmproot = tempfile.mkdtemp()
+    write_cfg({"root": tmproot, "depth": 1, "agents": ["claude"],
+               "prices": {"zz-made-up": [1.0, 8.0]}})
+    load_config(cfg)
+    apply_config()
+    assert ROOT == os.path.realpath(tmproot) and DEPTH == 1
+    assert set(AGENTS) == {"claude"}, "agents the config left out are not read"
+    assert PRICE["zz-made-up"] == (1.0, 8.0), "your prices go over the built-in table"
+    assert AGENTS["claude"]["glob"].startswith(CLAUDE), "the glob follows the dir"
+    os.rmdir(tmproot)
+    os.unlink(cfg)
+
+    HISTORY = 7
+    week = panel_history(40, {})
+    HISTORY = 14
+    assert "LAST 7 DAYS" in ANSI.sub("", week[0]) and len(week) == len(panel_history(40, {})), \
+        "the day count is a knob; the panel's height is not"
+
+    THEME_FILE = real_theme_file
+    os.environ.update(env_was)
+    (conf, source, complaints, ROOT, DEPTH, MAX_CARDS, HISTORY, WAIT_AFTER, IDLE_AFTER,
+     SIXEL, BELL, FRAME, REFRESH, CLAUDE, CODEX, OPENCODE, CREDS, SETTINGS, CHIBI_ART,
+     AGENTS, prices) = was
+    for live, back in ((CONF, conf), (SOURCE, source), (PRICE, prices)):
+        live.clear()
+        live.update(back)
+    COMPLAINTS[:] = complaints
+
+    # perf: the counters the p box and --bench read
+    add("x", 0.002)
+    add("x", 0.005)
+    assert _PERF["x"]["n"] == 2 and _PERF["x"]["worst"] == 0.005, "the worst one sticks"
+    assert pct([], 0.5) == 0.0 and pct([4, 1, 3, 2], 0.5) == 3, "nearest rank, sorted"
+    for _ in range(PERF_KEEP + 5):
+        add("x", 0.001)
+    assert len(_PERF["x"]["recent"]) == PERF_KEEP, "a timer keeps a window, not a log"
+    del _PERF["x"]
+    real_stdout = sys.stdout
+    report = bench(2)
+    assert sys.stdout is real_stdout, "bench must give the terminal back"
+    assert "render" in report and "paint" in report
+    assert _LAST[0] is None, "and leave nothing behind for the next real paint"
+    assert max(vlen(l) for l in perf_box(60, 20)) <= 60, "the box fits the width it got"
+
     print("ok")
 
 
@@ -2563,6 +3261,12 @@ DEMO_ROWS = (  # title, project, branch, model, effort, phase, age, tool, prompt
 )
 
 
+def demo_wt(project, branch):
+    """Where --demo's made-up worktree for branch sits: add_worktree's naming."""
+    return os.path.join(ROOT, project if branch == "main"
+                        else project + "." + branch.replace("/", "-"))
+
+
 def demo_data():
     """What collect() returns, made up: every panel has something in it and
     no real transcript is anywhere near. --demo, screenshots, the selftest."""
@@ -2576,13 +3280,19 @@ def demo_data():
                      id="demo-%d" % i, agent="codex" if r[3].startswith("gpt") else "claude",
                      cap=258400 if r[3].startswith("gpt") else None,
                      ctx=(i * 37 % 9 + 2) * 19000, msgs=14 + i * 9,
-                     cost=round(today * (8 - i) / 36, 2))
+                     cost=round(today * (8 - i) / 36, 2), cwd=demo_wt(r[1], r[2]))
                 for i, r in enumerate(DEMO_ROWS)]
+    # a repo per project, a worktree per branch off main, and one gone quiet
+    wts = {}
+    for _, proj, branch, *_ in DEMO_ROWS + (("", "dotfiles", "main"),):
+        wts.setdefault(proj, {"main": None})[branch] = None
+    repos = group(sessions, [[{"kind": "wt", "id": demo_wt(p, b), "path": demo_wt(p, b),
+                               "branch": b, "gone": False} for b in bs] for p, bs in wts.items()])
     days = [18.2, 22.5, 9.1, 0, 0, 25.3, 30.1, 27.8, 19.4, 24.6, 0, 12.3, 28.9, today]
     at = lambda s: (datetime.now(timezone.utc) + timedelta(seconds=s)).isoformat()
     lims, lim_err, lim_at = demo_limits()
     return {"sessions": sessions, "cost": today, "nsess": len(sessions), "at": time.time(),
-            "lims": lims, "lim_err": lim_err, "lim_at": lim_at,
+            "lims": lims, "lim_err": lim_err, "lim_at": lim_at, "repos": repos,
             "hours": {"cost": cost, "output": [int(v * 42000) for v in cost],
                       "tokens": [int(v * 1.6e6) for v in cost]},
             "days": {(now.date() - timedelta(days=13 - i)).isoformat(): v
@@ -2607,6 +3317,173 @@ def demo_limits(fetch=True):
               "scope": {"model": {"display_name": "Fable"}}}], None, time.time())
 
 
+# ------------------------------------------------------------------ perf
+
+# Always on. Ten perf_counter() calls against a repaint that writes kilobytes
+# is not a cost, and it means the p box is never empty when you open it.
+PERF_KEEP = 120  # samples a timer keeps: two minutes of once-a-second paints
+_PERF = {}       # name -> {"n", "total", "worst", "recent": [seconds]}
+_WROTE = [0, 0]  # bytes sync() sent, and how many writes that took
+_T0 = time.perf_counter()
+_CPU0 = sum(resource.getrusage(resource.RUSAGE_SELF)[:2])  # cpu already spent at _T0
+_CPU = [0.0, 0.0]  # (wall, cpu) when perf_rows() last looked, for a live %
+PERF_FILE = os.path.join(CACHE, "perf.txt")
+
+
+def profiling():
+    """--profile, and the env var it hands the tmux server we exec into."""
+    return os.environ.get("CCDASH_PERF") == "1"
+
+
+def add(name, secs):
+    r = _PERF.get(name)
+    if r is None:
+        r = _PERF[name] = {"n": 0, "total": 0.0, "worst": 0.0, "recent": []}
+    r["n"] += 1
+    r["total"] += secs
+    r["worst"] = max(r["worst"], secs)
+    r["recent"].append(secs)
+    del r["recent"][:max(0, len(r["recent"]) - PERF_KEEP)]  # max: a negative
+    # stop counts from the end, and would eat the window it is meant to keep
+
+
+class Timer:
+    """`with T_PAINT:` around a site. One instance per site, made once here,
+    so a tick allocates nothing; never nest an instance inside itself."""
+
+    __slots__ = ("name", "t0")
+
+    def __init__(self, name):
+        self.name, self.t0 = name, 0.0
+
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        add(self.name, time.perf_counter() - self.t0)
+
+
+T_RENDER = Timer("render")
+T_PAINT = Timer("paint")
+T_ART = Timer("art")
+T_SCAN = Timer("scan")
+T_FETCH = Timer("fetch")
+
+
+def pct(vals, q):
+    """Nearest-rank percentile; 0.0 when nothing has been timed yet."""
+    if not vals:
+        return 0.0
+    ordered = sorted(vals)
+    return ordered[min(len(ordered) - 1, int(q * len(ordered)))]
+
+
+def ms(v):
+    return "%.1fms" % (v * 1000)
+
+
+def dur(v):
+    return ms(v) if v < 1 else "%.2fs" % v
+
+
+def timer_row(name):
+    r = _PERF.get(name)
+    if not r or not r["recent"]:
+        return "nothing yet"
+    return "p50 %s · p95 %s · worst %s · %d× · %s total" % (
+        ms(pct(r["recent"], 0.5)), ms(pct(r["recent"], 0.95)), ms(r["worst"]),
+        r["n"], dur(r["total"]))
+
+
+def rss_bytes():
+    """Resident memory now. /proc is exact where it is; ru_maxrss is the peak
+    the process ever reached, in bytes on macOS and KiB everywhere else."""
+    try:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        return ru.ru_maxrss * (1 if sys.platform == "darwin" else 1024)
+
+
+def perf_rows():
+    """(label, text) per line of the p box, --bench and the saved report."""
+    wall = max(1e-9, time.perf_counter() - _T0)
+    # from _T0, not from exec: the interpreter's own startup is not ours
+    cpu = sum(resource.getrusage(resource.RUSAGE_SELF)[:2]) - _CPU0
+    d_wall, d_cpu = wall - _CPU[0], cpu - _CPU[1]
+    _CPU[0], _CPU[1] = wall, cpu  # "now" is the delta since this row last drew
+    try:
+        on_disk = os.path.getsize(SCAN_CACHE)
+    except OSError:
+        on_disk = 0
+    size, t = TERM.size(), tick()
+    return [(n, timer_row(n)) for n in ("render", "paint", "art", "scan", "fetch")] + [
+        ("output", "%sB in %d writes · %sB/s" % (si(_WROTE[0]), _WROTE[1],
+                                                 si(_WROTE[0] / wall))),
+        ("cpu", "%.1f%% of a core now · %.1f%% over %s · rss %sB" % (
+            100 * d_cpu / d_wall if d_wall > 0 else 0.0, 100 * cpu / wall,
+            ago(wall), si(rss_bytes()))),
+        ("frames", "%.1f/s drawn · %d art frames · %s each" % (
+            _WROTE[1] / wall, nframes(), "%.2fs" % t if t else "still")),
+        ("cache", "%d sessions · %sB on disk" % (len(_SCAN or {}), si(on_disk))),
+        ("terminal", "%dx%d cells · sixel %s · %d threads · python %d.%d" % (
+            size.columns, size.lines,
+            "%dx%d px" % TERM.sixel if TERM.sixel else "no",
+            threading.active_count(), sys.version_info[0], sys.version_info[1])),
+    ]
+
+
+def perf_report():
+    """The same rows as plain text: what --bench prints and --profile keeps."""
+    return "\n".join("%-10s %s" % r for r in perf_rows())
+
+
+def perf_box(width, height):
+    """What p puts up: the cost of this run, boxed like the help."""
+    inner = max(10, min(60, width - 6))
+    rows = [ACC + "PERF" + R]
+    rows += [TXT + label.ljust(10) + MUT + cut(text, inner - 10) + R
+             for label, text in perf_rows()]
+    rows += ["", DIM + "p or esc closes · this run only" + R]
+    box = ([BOR + "╭" + "─" * (inner + 2) + "╮" + R]
+           + [BOR + "│ " + R + pad(r, inner) + BOR + " │" + R for r in rows]
+           + [BOR + "╰" + "─" * (inner + 2) + "╯" + R])
+    left = " " * max(0, (width - inner - 4) // 2)
+    return [""] * max(0, (height - len(box)) // 2) + [left + l for l in box]
+
+
+def bench(n=200):
+    """--bench: n frames of --demo data rendered and painted into nothing, so
+    a change's cost shows without a terminal to watch."""
+    data = demo_data()
+    data["lims"], data["lim_err"], data["lim_at"] = demo_limits()
+    ui, width, body = UI(), 120 - 2 * PAD_X, 33
+    saved, null = sys.stdout, open(os.devnull, "w")
+    try:
+        sys.stdout = null
+        for i in range(n):
+            lines, _art = render(data, width, body, ui, i % nframes())
+            paint(lines[:body] + [footer(width, data["at"], ui.more, ui)], body + 1)
+    finally:
+        sys.stdout = saved
+        null.close()
+        _LAST[:] = [None, [], 0]  # a real paint after this starts from nothing
+    return perf_report()
+
+
+def save_perf():
+    """--profile's deliverable: run() re-execs itself into a tmux server whose
+    pane dies on quit, so the report has to outlive the terminal."""
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(PERF_FILE, "w") as f:
+            f.write(perf_report() + "\n")
+    except OSError:
+        pass
+
+
 # ------------------------------------------------------------------- tui
 
 PAD_Y, PAD_X = 1, 2  # blank rows over everything, blank cells either side
@@ -2614,6 +3491,8 @@ PAD_Y, PAD_X = 1, 2  # blank rows over everything, blank cells either side
 
 def sync(s):
     """Write s as one synchronized update: the terminal shows all or none."""
+    _WROTE[0] += len(s)
+    _WROTE[1] += 1
     sys.stdout.write("\033[?2026h" + s + "\033[?2026l")
     sys.stdout.flush()
 
@@ -2632,36 +3511,40 @@ def paint(lines, height, image="", band=0):
     many leading `lines` the art covers: those are rewritten every time -
     sixel is opaque, and a frame tick draws over them without coming here.
     """
-    rows = ([""] * PAD_Y + [" " * PAD_X + l for l in lines])[:height]
-    size = (height, TERM.seen_ws)
-    # R before each erase: \033[K and \033[J fill with the current bg, which
-    # is how the theme background reaches every cell
-    if size != _LAST[0]:  # first paint, or a resize: everything
-        out = "\033[H" + "\r\n".join(R + l + R + "\033[K" for l in rows) + "\033[J"
-    else:
-        art = PAD_Y + max(band, _LAST[2])
-        out = "".join("\033[%d;1H%s%s%s\033[K" % (i + 1, R, l, R)
-                      for i, l in enumerate(rows)
-                      if i < art or [l] != _LAST[1][i:i + 1])
-        if len(rows) < len(_LAST[1]):  # shorter than last time: wipe the leftovers
-            out += "\033[%d;1H%s\033[J" % (len(rows) + 1, R)
-    _LAST[:] = [size, rows, band]
-    sync(out + image)
+    with T_PAINT:  # ends in sync(), so the write counts as part of a paint
+        rows = ([""] * PAD_Y + [" " * PAD_X + l for l in lines])[:height]
+        size = (height, TERM.seen_ws)
+        # R before each erase: \033[K and \033[J fill with the current bg, which
+        # is how the theme background reaches every cell
+        if size != _LAST[0]:  # first paint, or a resize: everything
+            out = "\033[H" + "\r\n".join(R + l + R + "\033[K" for l in rows) + "\033[J"
+        else:
+            art = PAD_Y + max(band, _LAST[2])
+            out = "".join("\033[%d;1H%s%s%s\033[K" % (i + 1, R, l, R)
+                          for i, l in enumerate(rows)
+                          if i < art or [l] != _LAST[1][i:i + 1])
+            if len(rows) < len(_LAST[1]):  # shorter than last time: wipe the leftovers
+                out += "\033[%d;1H%s\033[J" % (len(rows) + 1, R)
+        _LAST[:] = [size, rows, band]
+        sync(out + image)
 
 
 def footer(width, at, more, ui, error=""):
-    if ui.confirm:  # the whole line asks before the agents go with us
-        return pad(ACC + cut("close %d agent windows? y/n" % ui.confirm, width),
-                   width) + R
-    if ui.typing:  # the whole line is the filter prompt
-        hint = "  ⏎ keep · esc clear"
-        q = cut(ui.find, max(1, width - 2 - cells(hint))) if ui.find else ""
-        return pad(ACC + "/" + TXT + q + ACC + "▏" + DIM
-                   + hint[:max(0, width - 2 - cells(q))], width) + R
-    # what broke in the worker takes the stamp's place until a scan lands
-    stamp = cut("! " + error, width) if error else cut(
-        "%s · updated %s" % (THEME, datetime.fromtimestamp(at).strftime("%H:%M")), width)
-    parts = ([("q", "quit")] + ([("⏎", "resume")] if ui.sel else [("hjkl", "select")])
+    if ui.confirm:  # the whole line asks: before the agents go with us, or a worktree
+        return pad(ACC + cut(ui.confirm[0], max(1, width - 4)) + " y/n", width) + R
+    if ui.typing:  # the whole line is the prompt
+        lead, text, hint = (("/", ui.find, "  ⏎ keep · esc clear") if ui.typing == "/"
+                            else ("new branch: ", ui.name, "  ⏎ add worktree · esc cancel"))
+        q = cut(text, max(1, width - cells(lead) - 1 - cells(hint))) if text else ""
+        return pad(ACC + lead + TXT + q + ACC + "▏" + DIM
+                   + hint[:max(0, width - cells(lead) - 1 - cells(q))], width) + R
+    # what a worktree command did, else what broke in the worker, takes the
+    # stamp's place: the one until the next key, the other until a scan lands
+    said = ui.msg or ("! " + error if error else "")
+    stamp = cut(said or "%s · updated %s" % (
+        THEME, datetime.fromtimestamp(at).strftime("%H:%M")), width)
+    parts = ([("q", "quit")] + ([("⏎", "open")] if ui.sel else [("hjkl", "select")])
+             + ([("esc", "back"), ("c", "worktree")] if ui.repo else [])
              + [("/", cut(ui.find, 16) if ui.find else "filter"), ("?", "help"),
                 ("t", "theme"), ("g", "chart"), ("r", "refresh")]
              + ([("J/K", "scroll")] if more else []))
@@ -2670,17 +3553,21 @@ def footer(width, at, more, ui, error=""):
         parts.pop()
     hints = "  ".join(ACC + k + DIM + " " + a for k, a in parts)  # not keys(): that tokenises
     return (DIM + hints + " " * (width - vlen(hints) - cells(stamp))
-            + (RED if error else "") + stamp + R)
+            + (RED if said.startswith("!") else ACC if said else "") + stamp + R)
 
 
-KEYS = (("q", "quit (asks if agents are open)"), ("hjkl ←→↑↓", "pick a card"),
-        ("⏎", "open the picked session in its own tmux window"),
+KEYS =(("q", "quit (asks if agents are open)"), ("hjkl ←→↑↓", "pick a card or row"),
+        ("⏎", "open: a repo, a new claude in a worktree, a session"),
+        ("esc", "back to the repos; there, drop the pick and filter"),
+        ("c", "in a repo: add a worktree, beside it as repo.branch"),
+        ("D", "remove the picked worktree (git refuses if dirty)"),
         ("alt+0", "in a session: back here; alt+1-9 jump to one"),
-        ("/", "filter by title, project, branch or prompt"),
-        ("esc", "drop the pick and filter"),
+        ("/", "filter by name, branch, title or prompt"),
         ("r", "refresh now"), ("t", "next theme"),
         ("g", "hourly chart: $ / output / all tokens"),
-        ("J K", "scroll (PgUp PgDn too)"), ("wheel", "scroll"),
+        ("p", "what ccdash itself costs: frames, scan, memory"),
+        ("J K", "scroll the cards, or the list in a repo (PgUp PgDn too)"),
+        ("wheel", "the same scroll; the clock and stats stay put"),
         ("ctrl+z", "suspend; fg comes back repainted"),
         ("?", "this help"))
 
@@ -2695,10 +3582,11 @@ def help_box(width, height):
              for n in sorted(THEMES)]
     rows += ["", ACC + "CUSTOM" + R]
     rows += [DIM + l[:inner] + R for l in (  # cut() would squash the indent
-        "~/.config/ccdash/themes.json:",
+        home(CONFIG_FILE) + ":",
+        "  ccdash --config writes a starter file",
+        home(USER_THEMES) + ":",
         '  {"mine": {"bg": "#101010", "acc": "#ff8800"}}',
-        "roles: " + " ".join(ROLES),
-        "CCDASH_THEME=name  CCDASH_ART=path  CCDASH_SIXEL=0")]
+        "roles: " + " ".join(ROLES))]
     rows += ["", DIM + "any key closes" + R]
     box = ([BOR + "╭" + "─" * (inner + 2) + "╮" + R]
            + [BOR + "│ " + R + pad(r, inner) + BOR + " │" + R for r in rows]
@@ -2924,7 +3812,8 @@ class Refresher(threading.Thread):
             if not (old is None or self.now or time.time() - old["at"] >= REFRESH):
                 return
             self.now = False
-            new = snapshot()  # by name: --demo swaps collect/limits under it
+            with T_SCAN:
+                new = snapshot()  # by name: --demo swaps collect/limits under it
             # scan() ages derive()'s copy, so the last snap's sessions still hold
             # the ages they were drawn with: `was` reads the same after the scan
             if old and stopped({s["id"]: state(s)[0] for s in old["sessions"]},
@@ -2934,7 +3823,7 @@ class Refresher(threading.Thread):
         except Exception as exc:  # keep the last good data, say what broke, carry on
             empty = {"sessions": [], "totals": dict(dict.fromkeys(TOK, 0), msgs=0),
                      "cost": 0.0, "hours": {k: [0] * 24 for k, _ in METRICS},
-                     "days": {}, "by_model": {}, "nsess": 0, "limits": [],
+                     "days": {}, "by_model": {}, "nsess": 0, "limits": [], "repos": [],
                      "lims": [], "lim_err": None, "lim_at": 0.0}
             self.snap = dict(self.snap or empty, at=time.time(),
                              error="%s: %s" % (type(exc).__name__, exc))
@@ -2986,40 +3875,39 @@ def run():
                     w.poke()  # back from a session: fresh numbers first
                 seen = vis
                 if w.bells != rung:  # a session stopped to wait on you
-                    rung = w.bells
-                    sys.stdout.write("\a")
-                if cut_for != (data["at"], ui.find):  # same data, same filter: same view
-                    q = ui.find.lower()
-                    view = [s for s in data["sessions"] if q in " ".join(filter(None, (
-                        s["title"], s["project"], s["branch"], s["prompt"]))).lower()]
-                    cut_for = (data["at"], ui.find)
+                    rung = w.bells  # muted or not: one bell, not a queue of them
+                    if BELL:
+                        sys.stdout.write("\a")
+                if ui.repo and not opened(data, ui):
+                    ui.repo = None  # gone from the scan: back to the repos
+                if cut_for != (data["at"], ui.find, ui.repo):  # same data, filter, repo:
+                    view = items(data, ui)  # same view
+                    cut_for = (data["at"], ui.find, ui.repo)
                 size = TERM.size()
                 width = size.columns - 2 * PAD_X
                 body = max(1, size.lines - 1 - PAD_Y)
                 t = tick()
                 frame = int(time.time() / t) % nframes() if t else 0
                 now = (size, TERM.sixel, ui.off, data["at"], THEME, ui.chart, ui.helping,
-                       ui.sel, ui.find, ui.typing, ui.confirm, int(time.time() // 60))
+                       ui.sel, ui.find, ui.typing, ui.confirm, ui.repo, ui.name, ui.msg,
+                       ui.perf,
+                       # the clock in the footer moves once a minute; the cost
+                       # box, once a second, or its numbers look frozen
+                       int(time.time()) if ui.perf else int(time.time() // 60))
                 if vis and now == painted and frame != drawn:
-                    sync(chibi_at(art, frame, ui.off, body))  # the art is all that moved
+                    with T_ART:
+                        sync(chibi_at(art, frame))  # the art is all that moved
                     drawn = frame
                 elif vis and now != painted:
                     painted, drawn = now, frame
                     lines, art = ((help_box(width, body), None) if ui.helping else
-                                  render(dict(data, sessions=view), width, body, ui, frame))
-                    if ui.follow:  # scroll the picked card (the one drawn ┏━┓) into view
-                        top = next((i for i, l in enumerate(lines) if "┏" in l), None)
-                        if top is not None:
-                            ui.off = min(max(ui.off, top + CARD_H - body), top)
-                        ui.follow = False
-                    ui.off = max(0, min(ui.off, len(lines) - body))
-                    # ponytail: scrolled at all, the sixel chibi just blanks - sixel
-                    # has no clipping. Crop the frame by off rows if scrolling gets common.
-                    paint(lines[ui.off:ui.off + body]
-                          + [footer(width, data["at"], len(lines) > body, ui,
+                                  (perf_box(width, body), None) if ui.perf else
+                                  render(dict(data, view=view), width, body, ui, frame))
+                    paint(lines[:body]
+                          + [footer(width, data["at"], ui.more, ui,
                                     data.get("error", ""))],
                           size.lines,
-                          chibi_at(art, frame, ui.off, body) if TERM.sixel else "",
+                          chibi_at(art, frame) if TERM.sixel else "",
                           art[0] if art else 0)
                 # doubles as the resize poll - render() is pure, so reflow is free.
                 # Wake on the frame boundary: a flat FRAME sleep drifts by the
@@ -3028,56 +3916,97 @@ def run():
                 if ui.helping and key:
                     ui.helping = False
                     continue
-                if ui.confirm and key:  # y closes the agent windows with us
+                if ui.perf and key and key not in ("q", "\x03", "\x04"):
+                    ui.perf = key not in ("p", "\033")  # p or esc closes; q still quits
+                    continue
+                if key:
+                    ui.msg = ""  # said its piece
+                if ui.confirm and key:  # y: quit, agent windows and all - or remove
+                    ask, ui.confirm = ui.confirm, None
                     if key in ("y", "Y"):
-                        break
-                    ui.confirm = 0
+                        if ask[1] is None:
+                            break
+                        ui.msg = ask[1]()
+                        w.poke()
                     continue
                 if key in ("\x03", "\x04"):
-                    ui.typing = False  # quitting works from the filter prompt too
-                if ui.typing:
+                    ui.typing = False  # quitting works from a prompt too
+                if ui.typing:  # into ui.find for "/", ui.name for "branch"
+                    f = "find" if ui.typing == "/" else "name"
+                    text = getattr(ui, f)
                     if key in ("\n", "\r"):
                         ui.typing = False
+                        if f == "name" and (r := opened(data, ui)) and r["path"]:
+                            ui.msg = add_worktree(r["path"], text)
+                            w.poke()
                     elif key == "\033":
-                        ui.typing, ui.find = False, ""
+                        ui.typing, text = False, ""
                     elif key in ("\x7f", "\b"):
-                        ui.find = ui.find[:-1]
+                        text = text[:-1]
                     elif isinstance(key, tuple):  # a paste, one line of it or ten
-                        ui.find += "".join(c for c in key[1] if c.isprintable())
+                        text += "".join(c for c in key[1] if c.isprintable())
                     elif key and len(key) == 1 and key.isprintable():
-                        ui.find += key
+                        text += key
+                    setattr(ui, f, text)
                     continue
-                ids = [s["id"] for s in view[:ui.grid[1]]]
+                ids = [it["id"] for it in view[:ui.grid[1]]]
+                it = view[ids.index(ui.sel)] if ui.sel in ids else {}
                 step = {"h": -1, "left": -1, "l": 1, "right": 1, "j": ui.grid[0],
                         "down": ui.grid[0], "k": -ui.grid[0], "up": -ui.grid[0]}.get(key)
                 if step and ids:
                     i = ids.index(ui.sel) + step if ui.sel in ids else 0
                     ui.sel, ui.follow = ids[max(0, min(len(ids) - 1, i))], True
-                elif key in ("\n", "\r") and ui.sel in ids and not DEMO:
-                    if not os.environ.get("TMUX"):
-                        resume = view[ids.index(ui.sel)]
+                elif key in ("\n", "\r") and it:
+                    if it.get("kind") == "repo":  # in: its worktrees and sessions
+                        ui.repo, ui.sel, ui.find, ui.off = it["id"], None, "", 0
+                    elif DEMO:
+                        pass  # made-up sessions: nothing to open
+                    elif it.get("gone"):
+                        ui.msg = "! that worktree's folder is gone - D removes it"
+                    elif not os.environ.get("TMUX"):
+                        resume = it  # main() runs it here; quitting it comes back
                         break
-                    open_window(ui.sel)  # the dashboard stays on, in its own window
+                    elif it.get("kind") == "wt":  # a new claude there, a window of its own
+                        tmux_out(*window_cmd(str(uuid.uuid4()), it["path"]))
+                    else:
+                        open_window(ui.sel)  # the dashboard stays on, in its own window
+                elif key in ("\033", "\x7f") and ui.repo and not ui.find:
+                    ui.sel, ui.repo, ui.follow = ui.repo, None, True  # out, on the repo
                 elif key == "\033" and (ui.sel or ui.find):
                     ui.sel, ui.find = None, ""
+                elif key == "c" and (opened(data, ui) or {}).get("path") and not DEMO:
+                    ui.typing, ui.name = "branch", ""
+                elif key == "D" and it.get("kind") == "wt" and not DEMO:
+                    live = sum(state(s)[0] in ("working", "waiting") for s in it["sessions"])
+                    if it["main"]:
+                        ui.msg = "! that's the repo's own checkout - it stays"
+                    elif live:  # git would pull the folder out from under an agent
+                        ui.msg = "! %d session%s at work in it" % (live, "s" * (live > 1))
+                    else:
+                        ui.confirm = ("remove worktree %s? its branch stays" % home(it["path"]),
+                                      functools.partial(remove_worktree, opened(data, ui)["path"],
+                                                        it["path"]))
                 elif key in ("q", "\x03"):
                     wins = OURS and open_windows()  # quitting takes the server
                     if not wins:
                         break
-                    ui.confirm = len(wins)  # the footer asks; y goes, anything else stays
+                    # the footer asks; y goes, anything else stays
+                    ui.confirm = ("close %d agent windows?" % len(wins), None)
                 elif key == "\x04":
                     break
                 elif key == "\x1a":  # ctrl+z, ISIG being off
                     suspend()
                     painted = None
                 elif key == "/":
-                    ui.typing = True
+                    ui.typing = "/"
                 elif key == "r":
                     w.poke()  # the worker refreshes now, bell and all
                 elif key == "t":
                     next_theme()
                 elif key == "g":
                     ui.chart = (ui.chart + 1) % len(METRICS)
+                elif key == "p":
+                    ui.perf = True
                 elif key == "?":
                     ui.helping = True
                 half = size.lines // 2
@@ -3087,6 +4016,8 @@ def run():
             pass
         finally:
             w.stop()  # saves the scan cache, once the worker is out of it
+            if profiling():
+                save_perf()
     return resume
 
 
@@ -3126,7 +4057,8 @@ def side(sid, pid):
                 frame = int(time.time() / t) % nframes() if t else 0
                 now = (size, TERM.sixel, at, int(time.time() // 60))
                 if vis and now == painted and frame != drawn:
-                    sync(chibi_at(art, frame))
+                    with T_ART:
+                        sync(chibi_at(art, frame))
                     drawn = frame
                 elif vis and now != painted:
                     painted, drawn = now, frame
@@ -3163,7 +4095,9 @@ TMUX_SETUP = [["set", "-g", "status", "off"], ["set", "-g", "mouse", "on"],
                    for i in range(1, 10)]
 
 
-def tmux_out(*args):
+# F811: selftest's `global tmux_out` comes earlier in the file than this def,
+# so ruff reads it as a first definition. This is the only one.
+def tmux_out(*args):  # noqa: F811
     """Lines a tmux command prints - to the server $TMUX names - or [] if it fails."""
     try:
         return subprocess.run(["tmux"] + list(args), capture_output=True,
@@ -3188,9 +4122,12 @@ def open_windows():
     return out
 
 
-def window_cmd(sid):
+def window_cmd(sid, new=None):
     # -S: an open session is just switched to - two claudes on one
-    # transcript would trample each other
+    # transcript would trample each other. `new` is the folder a new claude
+    # starts in, as session sid, so the window has its name from the start.
+    if new:
+        return ["new-window", "-n", sid, "-c", new, shlex.join(ME + ["--new", sid])]
     return ["new-window", "-S", "-n", sid, shlex.join(ME + ["--here", sid])]
 
 
@@ -3224,12 +4161,16 @@ def enter_tmux(sid=None):
         pass
 
 
-def resume(sid, wait=False):
-    """Reopen session sid with its own agent, in the session's folder. In
-    tmux we become the agent, render_side split off beside it watching this
-    pid; `wait` runs it as a child instead, so the dashboard comes back."""
-    s = find_session(sid)
-    argv = AGENTS[s["agent"] if s else "claude"]["resume"] + [sid]
+def resume(sid, wait=False, new=False):
+    """Reopen session sid with its own agent, in the session's folder - or,
+    `new`, start a claude here as session sid. In tmux we become the agent,
+    render_side split off beside it watching this pid; `wait` runs it as a
+    child instead, so the dashboard comes back."""
+    # ponytail: new sessions are claude's only - codex and opencode can't be
+    # handed an id, and the window is named by it. A picker if that's missed.
+    s = None if new else find_session(sid)
+    argv = (["claude", "--session-id", sid] if new
+            else AGENTS[s["agent"] if s else "claude"]["resume"] + [sid])
     try:
         os.chdir(s and s["cwd"] or ".")
     except OSError:
@@ -3282,6 +4223,12 @@ def statusline(stdin=sys.stdin):
     return " · ".join(parts) + (" · → " + tip if tip else "")
 
 
+def config_lines():
+    """Every knob, what this run goes by, and where that came from."""
+    return ["%-13s %-30s %s" % (k, json.dumps(CONF[k]), SOURCE.get(k, "default"))
+            for k in sorted(DEFAULTS)]
+
+
 def doctor():
     """--doctor: what ccdash can and can't see, one line each, with the fix."""
     out = []
@@ -3301,6 +4248,10 @@ def doctor():
           "optional: put a gif or png there, or set CCDASH_ART")
     check(bool(shutil.which("tmux")) or None, "tmux: ⏎ opens sessions beside the dashboard",
           "optional: without it ⏎ runs the agent in place")
+    n = len(find_repos(ROOT, DEPTH)) if shutil.which("git") else 0
+    check(bool(n) or None, "repos: %d under %s" % (n, home(ROOT)),
+          "set CCDASH_ROOT to where they live; git lists their worktrees"
+          if shutil.which("git") else "install git: repos and worktrees come from it")
     for name, a in AGENTS.items():
         n = len(found(name))
         check(bool(n) or None, "%s: %d transcripts under %s" % (
@@ -3331,7 +4282,11 @@ def doctor():
             termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         check(bool(cell) or None, "sixel: " + ("%dx%d px cells" % cell if cell else "no"),
               "optional: half blocks work anywhere")
-    out += ["", "config " + CONFIG, "cache  " + CACHE]
+    for bad in COMPLAINTS:
+        check(False, "config: " + bad, "ccdash --config lists every setting")
+    out += ["", "config " + CONFIG_FILE + ("" if os.path.isfile(CONFIG_FILE)
+                                           else " (none yet: ccdash --config > it)"),
+            "cache  " + CACHE, ""] + config_lines()
     return "\n".join(out)
 
 
@@ -3340,38 +4295,60 @@ def doctor():
 set_theme("ccdash")
 
 
-USAGE = """usage: ccdash [--demo] [--once] [--resume SESSION_ID]
-       ccdash --doctor | --statusline | --hook | --selftest | --version
+USAGE = """usage: ccdash [--demo] [--once] [--profile] [--resume SESSION_ID]
+       ccdash --config | --bench [N] | --doctor | --statusline | --hook
+                       | --selftest | --version
 
   --demo        made-up sessions: try it out, or take a screenshot
   --once        print one frame and exit (also what a pipe gets)
   --resume ID   open that session (Claude or Codex) straight away
+  --config      every setting and where it came from, as JSON
+  --bench [N]   time N frames offscreen: what a repaint costs
+  --profile     keep the cost report; p shows it live
   --doctor      what ccdash can see, and how to fix what it can't
   --statusline  one line for Claude Code's statusLine setting
   --hook        Claude Code Notification hook: exact 'waiting' cards
   --selftest    run the built-in tests"""
 
 
+def bench_n(args):
+    """--bench's frame count: the number after it, or 200."""
+    at = args.index("--bench") + 1
+    return int(args[at]) if len(args) > at and args[at].isdigit() else 200
+
+
 def main():
     global DEMO, collect, limits
     args = sys.argv[1:]
-    if "--hook" in args:  # first: it runs on every notification
-        return hook()
-    if "--selftest" in args:
+    if "--selftest" in args:  # before any config: a stray one must not fail it
         return selftest()
+    if "--hook" in args:  # first after that: it runs on every notification
+        return hook()
+    load_config()
+    apply_config()
+    if "--profile" in args:  # the tmux server we exec, and its windows, inherit it
+        os.environ["CCDASH_PERF"] = "1"
     if "--version" in args:
         return print("ccdash " + __version__)
+    if "--bench" in args:
+        return print(bench(bench_n(args)))
+    if "--config" in args:
+        return print(json.dumps({k: CONF[k] for k in sorted(DEFAULTS)}, indent=2))
     if "--statusline" in args:
         return print(statusline())
     if "--doctor" in args:
         return print(doctor())
     load_themes()
-    set_theme(pick_theme())
+    set_theme(CONF["theme"])
     if "-h" in args or "--help" in args:
         return print(
             __doc__.strip() + "\n\n" + USAGE +
+            "\n\nThe cards are the git repos under " + home(ROOT) + " (the `root`"
+            "\nsetting), %d levels deep (`depth`); ⏎ on one lists its worktrees and" % DEPTH
+            + "\ntheir sessions, esc comes back. Sessions in no repo there go on an"
+            "\n'other' card."
             "\n\nIn tmux (a server of its own per run) the dashboard is window 0;"
-            "\n⏎ on a card, or --resume, opens that session in a window of its own"
+            "\n⏎ on a session, or --resume, opens it in a window of its own"
             "\nwith a column of art, limits and stats beside it. alt+0 comes back"
             "\nhere, alt+1-9 jump between sessions; q or ctrl+c here closes it all,"
             "\nagents included, asking first if any agent windows are open; ctrl+d"
@@ -3379,11 +4356,18 @@ def main():
             "\nquitting it comes back to the dashboard."
             "\n\nkeys:\n"
             + "\n".join("  %-10s %s" % ka for ka in KEYS)
-            + "\n\nthemes: %s\n  `t` cycles and remembers (%s); CCDASH_THEME=name"
+            + "\n\nsettings: %s\n  `ccdash --config` prints what this run goes by;"
+            "\n  redirect it there to start a file, then edit it. `--doctor` adds"
+            "\n  where each one came from. An env var beats the file, for one run:"
+            "\n  %s\n  %s."
+            % ((CONFIG_FILE,)
+               + tuple("  ".join(g) for g in (sorted(set(ENVS.values()))[:4],
+                                              sorted(set(ENVS.values()))[4:])))
+            + "\n\nthemes: %s\n  `t` cycles and remembers (in %s); CCDASH_THEME=name"
             "\n  overrides. Your own go in %s as"
             '\n  {"name": {"bg": "#101010", "acc": "#ff8800", ...}}; roles:'
             "\n  %s - missing ones come from ccdash."
-            % (", ".join(sorted(THEMES)), THEME_FILE, USER_THEMES, " ".join(ROLES))
+            % (", ".join(sorted(THEMES)), CONFIG_FILE, USER_THEMES, " ".join(ROLES))
             + "\n\nart: %s, or CCDASH_ART=path; an animated gif plays, a still"
             "\n  image sits there, no file means the built-in chibi. Terminals with"
             "\n  sixel get real pixels; CCDASH_SIXEL=0 forces half blocks."
@@ -3395,13 +4379,13 @@ def main():
     if "--demo" in args:  # nothing read, fetched or resumed
         DEMO, collect, limits = True, demo_data, demo_limits
 
-    if args[:1] in (["--resume"], ["--here"], ["--side"]):
+    if args[:1] in (["--resume"], ["--here"], ["--side"], ["--new"]):
         if len(args) != (3 if args[0] == "--side" else 2):
             sys.exit("usage: ccdash --resume SESSION_ID")
         if args[0] == "--side":
             return side(args[1], int(args[2]))
-        if args[0] == "--here":  # what a window open_window() made runs
-            return resume(args[1])
+        if args[0] in ("--here", "--new"):  # what a window window_cmd() made runs
+            return resume(args[1], new=args[0] == "--new")
 
     if "--once" in args or not sys.stdout.isatty():
         size = shutil.get_terminal_size((120, 34))
@@ -3420,7 +4404,16 @@ def main():
         s = run()
         if not s:
             break
-        resume(s["id"], wait=True)
+        if s.get("kind") == "wt":  # a new claude, in that worktree
+            try:
+                os.chdir(s["path"])
+            except OSError:
+                continue  # removed since the scan: the next one says so
+            resume(str(uuid.uuid4()), wait=True, new=True)
+        else:
+            resume(s["id"], wait=True)
+    if profiling():
+        sys.stderr.write("ccdash: cost report in %s\n" % PERF_FILE)
     if OURS:  # q or ctrl+c: the whole server goes, agent windows and all
         tmux_out("kill-server")
 

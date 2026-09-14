@@ -1,0 +1,7 @@
+# Only the actions: ccdash has no pip dependencies to bump.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

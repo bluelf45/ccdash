@@ -1,13 +1,20 @@
 name: ci
 on: [push, pull_request]
 
+permissions:
+  contents: read
+
+concurrency:  # a new push supersedes the run still going for the same ref
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   selftest:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.8", "3.x"]
+        python: ["3.8", "3.13"]
         pillow: [true, false]
         exclude:  # no 3.8 builds for Apple silicon runners
           - os: macos-latest
@@ -22,3 +29,28 @@ jobs:
         run: pip install Pillow
       - run: python ccdash.py --selftest
       - run: python ccdash.py --demo --once > /dev/null
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff==0.16.7
+      - run: ruff check ccdash.py
+
+  package:  # the wheel and its entry points break in a PR, not at release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build
+      - run: pip install dist/*.whl
+      - run: ccdash --version
+      - run: ccdash --config
+      - run: ccdash --doctor
+      - run: ccdash --bench 20

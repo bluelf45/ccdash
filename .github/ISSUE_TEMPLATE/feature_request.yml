@@ -1,0 +1,28 @@
+name: Feature request
+description: Something you want ccdash to tell you that it doesn't
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to find out, or do, when ccdash came up short. Describe
+        the situation, not the patch — the fix may be a setting that already exists.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What you do today instead
+      description: The command you run, the file you open, the thing you go and check.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What it could look like
+      description: Optional. A row, a panel, a key, a setting — whatever you had in mind.
+    validations:
+      required: false

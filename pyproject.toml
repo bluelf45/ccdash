@@ -10,10 +10,24 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
 keywords = ["claude-code", "codex", "opencode", "tui", "dashboard", "terminal"]
+authors = [{name = "Oscar Hernan Acevedo Bonvin"}]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
     "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
 ]
 
 [project.optional-dependencies]
@@ -24,9 +38,22 @@ ccdash = "ccdash:main"
 
 [project.urls]
 Homepage = "https://github.com/bluelf45/ccdash"
+Source = "https://github.com/bluelf45/ccdash"
+Issues = "https://github.com/bluelf45/ccdash/issues"
 
 [tool.setuptools]
 py-modules = ["ccdash"]
 
 [tool.setuptools.dynamic]
 version = {attr = "ccdash.__version__"}
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+# E741: `l` is a line everywhere in a renderer, and reads better than `line`
+#       inside the comprehensions that build every panel.
+# E731: the one-line lambdas are local formatters, named where they are used.
+ignore = ["E741", "E731"]
